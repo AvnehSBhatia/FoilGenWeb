@@ -356,7 +356,70 @@ def save_predictions_to_dat(results, test_features, save_dir='test_results', num
     print(f"Saved .dat files to {save_dir}")
 
 
-def run_neuralfoil_analysis(test_features, results, device='mps', num_samples=100):
+def load_re_mach_from_csv(csv_dir='unpacked_csv'):
+    """Load Re and Mach values from CSV files using the same logic as load_csv_data."""
+    csv_path = Path(csv_dir)
+    csv_files = list(csv_path.glob('*.csv'))
+    
+    re_mach_list = []
+    
+    for csv_file in csv_files:
+        try:
+            import csv
+            with open(csv_file, 'r') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            
+            for row in rows:
+                def safe_float(val, default=0.0):
+                    try:
+                        return float(val) if val and val != 'nan' and val != 'NaN' else default
+                    except:
+                        return default
+                
+                # Parse vectors to match the same validation logic as load_csv_data
+                alpha_str = str(row.get('alpha', '[]')).strip()
+                cl_str = str(row.get('Cl', '[]')).strip()
+                cd_str = str(row.get('Cd', '[]')).strip()
+                cl_cd_str = str(row.get('Cl_Cd', '[]')).strip()
+                
+                def parse_vector(vec_str):
+                    if not vec_str or vec_str == '':
+                        return np.array([])
+                    if vec_str.startswith('[') and vec_str.endswith(']'):
+                        try:
+                            lst = [float(x.strip()) for x in vec_str.strip("[]").split(",")]
+                            return np.array(lst, dtype=np.float32)
+                        except:
+                            return np.array([])
+                    else:
+                        try:
+                            return np.array([float(vec_str.strip())], dtype=np.float32)
+                        except:
+                            return np.array([])
+                
+                alpha_arr = parse_vector(alpha_str)
+                cl_arr = parse_vector(cl_str)
+                cd_arr = parse_vector(cd_str)
+                cl_cd_arr = parse_vector(cl_cd_str)
+                
+                min_len = min(len(alpha_arr), len(cl_arr), len(cd_arr), len(cl_cd_arr))
+                if min_len == 0:
+                    continue
+                
+                # Extract Re and Mach directly from CSV (not normalized)
+                re = safe_float(row.get('Re', 0))
+                mach = safe_float(row.get('Mach', 0))
+                
+                # Store Re and Mach for this valid row
+                re_mach_list.append({'re': re, 'mach': mach})
+        except:
+            continue
+    
+    return re_mach_list
+
+
+def run_neuralfoil_analysis(test_features, test_re_mach, results, device='mps', num_samples=100):
     """Run NeuralFoil analysis on predicted airfoils and compare with input characteristics."""
     if not NEURALFOIL_AVAILABLE:
         print("NeuralFoil not available. Skipping aerodynamic analysis.")
@@ -367,7 +430,7 @@ def run_neuralfoil_analysis(test_features, results, device='mps', num_samples=10
     print(f"{'='*60}")
     
     # Limit to num_samples
-    num_samples = min(num_samples, len(results['predictions']))
+    num_samples = min(num_samples, len(results['predictions']), len(test_features), len(test_re_mach))
     indices = np.arange(num_samples)
     
     input_cl_list = []
@@ -392,14 +455,29 @@ def run_neuralfoil_analysis(test_features, results, device='mps', num_samples=10
             # Prepare coordinates for NeuralFoil (needs to be Nx2 array)
             coordinates = np.column_stack([pred_x, pred_y])
             
-            # Get input features to extract Re, Mach, and alpha sequence
+            # Get input features to extract alpha sequence
             feature_dict = test_features[idx]
             
-            # Extract Re and Mach from scalar features
-            # Scalar features: [Re, Mach, LDMax, ClMax, CdMin, alpha_ClMax, alpha_CdMin, alpha_LDMax, min_thickness, max_thickness]
-            scalars = feature_dict['scalars']
-            re = scalars[0]  # This is normalized, need to denormalize
-            mach = scalars[1]  # This is normalized, need to denormalize
+            # Get Re and Mach directly from CSV (not normalized)
+            if idx < len(test_re_mach):
+                re_denorm = test_re_mach[idx]['re']
+                mach_denorm = test_re_mach[idx]['mach']
+            else:
+                # Fallback: denormalize from features
+                scalars = feature_dict['scalars']
+                try:
+                    norm_data = np.load('feature_normalization.npy', allow_pickle=True).item()
+                    re_min = norm_data['min'][0, 0]
+                    re_max = norm_data['max'][0, 0]
+                    re_range = re_max - re_min
+                    re_denorm = scalars[0] * re_range + re_min if re_range > 1e-6 else re_min
+                    mach_min = norm_data['min'][0, 1]
+                    mach_max = norm_data['max'][0, 1]
+                    mach_range = mach_max - mach_min
+                    mach_denorm = scalars[1] * mach_range + mach_min if mach_range > 1e-6 else mach_min
+                except:
+                    re_denorm = scalars[0] * (1e7 - 1e5) + 1e5
+                    mach_denorm = scalars[1] * 1.0
             
             # Get sequence to extract alpha values
             sequence = feature_dict['sequence']
@@ -409,36 +487,26 @@ def run_neuralfoil_analysis(test_features, results, device='mps', num_samples=10
             # We'll use alpha=0 or the first alpha in the sequence
             alpha = float(alpha_values[0]) if len(alpha_values) > 0 else 0.0
             
-            # Denormalize Re and Mach (need to load normalization params)
-            # For now, assume reasonable ranges if normalization file exists
-            try:
-                norm_data = np.load('feature_normalization.npy', allow_pickle=True).item()
-                re_min = norm_data['min'][0, 0]
-                re_max = norm_data['max'][0, 0]
-                re_range = re_max - re_min
-                re_denorm = scalars[0] * re_range + re_min
-                
-                mach_min = norm_data['min'][0, 1]
-                mach_max = norm_data['max'][0, 1]
-                mach_range = mach_max - mach_min
-                mach_denorm = scalars[1] * mach_range + mach_min
-            except:
-                # Fallback: assume Re is in range 1e5 to 1e7, Mach 0 to 1
-                re_denorm = scalars[0] * 1e7 + 1e5
-                mach_denorm = scalars[1] * 1.0
-            
             # Run NeuralFoil analysis
             # NeuralFoil expects coordinates as Nx2 array
             try:
-                nf_results = nf.get_aero_from_coords(
+                nf_results = nf.get_aero_from_coordinates(
                     coordinates=coordinates,
                     alpha=alpha,
                     Re=re_denorm,
                     model_size="xxxlarge"
                 )
                 
+                # Extract CL and CD (handle both scalar and array results)
                 pred_cl = nf_results['CL']
                 pred_cd = nf_results['CD']
+                
+                # If results are arrays, take first element
+                if isinstance(pred_cl, np.ndarray):
+                    pred_cl = float(pred_cl[0])
+                if isinstance(pred_cd, np.ndarray):
+                    pred_cd = float(pred_cd[0])
+                
                 pred_ld = pred_cl / pred_cd if pred_cd > 0 else 0
                 
                 # Get input values from sequence (use alpha closest to the one we tested)
@@ -726,6 +794,10 @@ def main():
     # Load XY coordinates
     xy_coords_data = load_xy_coordinates_from_data(features, 'bigfoil', num_points=512)
     
+    # Load Re and Mach values from CSV (before normalization/splitting)
+    print("Loading Re and Mach values from CSV files...")
+    re_mach_list_full = load_re_mach_from_csv('unpacked_csv')
+    
     # Normalize features
     print("Normalizing features...")
     features_normalized, min_vals, max_vals = normalize_features(features)
@@ -736,15 +808,22 @@ def main():
         features_normalized, xy_coords_data, test_size=0.1, random_state=42
     )
     
+    # Also split re_mach_list to match
+    _, test_re_mach_full = train_test_split(
+        re_mach_list_full, test_size=0.1, random_state=42
+    )
+    
     # Randomly select 100 samples
     num_test_samples = min(100, len(test_features_full))
     if num_test_samples < len(test_features_full):
         indices = np.random.choice(len(test_features_full), num_test_samples, replace=False)
         test_features = [test_features_full[i] for i in indices]
         test_xy_coords = test_xy_coords_full[indices]
+        test_re_mach = [test_re_mach_full[i] for i in indices]
     else:
         test_features = test_features_full
         test_xy_coords = test_xy_coords_full
+        test_re_mach = test_re_mach_full
     
     print(f"Test samples: {len(test_features)} (randomly selected {num_test_samples} from {len(test_features_full)})")
     
@@ -779,7 +858,7 @@ def main():
     print("Running NeuralFoil Analysis")
     print("="*60)
     neuralfoil_results = run_neuralfoil_analysis(
-        test_features, pipeline_results, device=device, num_samples=100
+        test_features, test_re_mach, pipeline_results, device=device, num_samples=100
     )
     
     print("\n" + "="*60)
