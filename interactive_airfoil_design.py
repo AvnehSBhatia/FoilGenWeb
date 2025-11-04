@@ -8,6 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import os
+from scipy.interpolate import interp1d, UnivariateSpline
 from train_aero_to_af512 import (
     normalize_features,
     AeroToAF512Net,
@@ -388,6 +389,216 @@ def run_neuralfoil_comparison(x_coords, y_coords, alpha, cl_input, cd_input, cl_
     }
 
 
+class InteractivePlot:
+    """Interactive matplotlib plot for entering points by clicking."""
+    def __init__(self, title, xlabel, ylabel, alpha_range):
+        self.title = title
+        self.xlabel = xlabel
+        self.ylabel = ylabel
+        self.alpha_range = alpha_range
+        self.points = []  # List of (alpha, value) tuples
+        self.spline_smoothing = 0.0  # Spline smoothing parameter (0 = interpolation, >0 = smoothing)
+        self.zoom_state = None  # Store zoom state (xlim, ylim) when zoomed
+        
+        self.fig, self.ax = plt.subplots(figsize=(10, 6))
+        # Enable matplotlib toolbar for zoom/pan (should be enabled by default)
+        
+        self.ax.set_title(f"{title}\nLeft-click to add points | Right-click to zoom/pan | 'd' to delete | 'c' to clear | 'q' to finish", 
+                         fontsize=11)
+        self.ax.set_xlabel(xlabel)
+        self.ax.set_ylabel(ylabel)
+        self.ax.set_xlim(alpha_range[0] - 1, alpha_range[1] + 1)
+        self.ax.grid(True, alpha=0.3)
+        
+        self.line = None
+        self.point_plot = None
+        self.update_plot()
+        
+        # Connect events - only connect left-click, let matplotlib handle right-click for zoom/pan
+        self.fig.canvas.mpl_connect('button_press_event', self.onclick)
+        self.fig.canvas.mpl_connect('key_press_event', self.onkey)
+        
+        # Store original toolbar
+        self.toolbar = self.fig.canvas.toolbar
+        
+    def onclick(self, event):
+        """Handle mouse clicks."""
+        if event.inaxes != self.ax:
+            return
+        # Only left-click adds points, right-click and middle-click are for zoom/pan
+        if event.button == 1:  # Left click only
+            alpha = event.xdata
+            value = event.ydata
+            self.points.append((alpha, value))
+            # Sort by alpha
+            self.points.sort(key=lambda x: x[0])
+            self.update_plot()
+            self.fig.canvas.draw()
+    
+    def onkey(self, event):
+        """Handle keyboard events."""
+        if event.key == 'd':  # Delete last point
+            if self.points:
+                self.points.pop()
+                self.update_plot()
+                self.fig.canvas.draw()
+        elif event.key == 'c':  # Clear all
+            self.points = []
+            self.update_plot()
+            self.fig.canvas.draw()
+        elif event.key == 'q':  # Quit
+            plt.close(self.fig)
+        elif event.key == 'r':  # Reset view
+            self.zoom_state = None  # Clear zoom state
+            self.ax.set_xlim(self.alpha_range[0] - 1, self.alpha_range[1] + 1)
+            if len(self.points) > 0:
+                values = np.array([p[1] for p in self.points])
+                if len(values) > 0:
+                    y_min, y_max = values.min(), values.max()
+                    y_range = y_max - y_min
+                    if y_range > 0:
+                        padding = y_range * 0.1
+                        self.ax.set_ylim(y_min - padding, y_max + padding)
+            self.fig.canvas.draw()
+    
+    def update_plot(self):
+        """Update the plot with current points."""
+        # Store current view limits if zoomed (before clearing)
+        try:
+            current_xlim = self.ax.get_xlim()
+            current_ylim = self.ax.get_ylim()
+            default_xlim = (self.alpha_range[0] - 1, self.alpha_range[1] + 1)
+            # Check if zoomed (not at default view)
+            is_zoomed = (abs(current_xlim[0] - default_xlim[0]) > 0.1 or 
+                        abs(current_xlim[1] - default_xlim[1]) > 0.1)
+            if is_zoomed:
+                self.zoom_state = (current_xlim, current_ylim)
+            else:
+                self.zoom_state = None
+        except:
+            is_zoomed = False
+            # Use stored zoom state if available
+            if self.zoom_state is not None:
+                current_xlim, current_ylim = self.zoom_state
+                is_zoomed = True
+            else:
+                current_xlim = None
+                current_ylim = None
+        
+        self.ax.clear()
+        self.ax.set_title(f"{self.title}\nLeft-click to add points | Right-click to zoom/pan | 'd' to delete | 'c' to clear | 'q' to finish", 
+                         fontsize=11)
+        self.ax.set_xlabel(self.xlabel)
+        self.ax.set_ylabel(self.ylabel)
+        self.ax.grid(True, alpha=0.3)
+        
+        if len(self.points) > 0:
+            alphas = np.array([p[0] for p in self.points])
+            values = np.array([p[1] for p in self.points])
+            
+            # Plot points
+            self.ax.plot(alphas, values, 'bo', markersize=10, label='Control Points', zorder=5)
+            
+            # Plot spline interpolation if more than one point
+            if len(self.points) > 1:
+                # Show spline interpolated preview on alpha vector
+                alpha_vec = np.linspace(self.alpha_range[0], self.alpha_range[1], 200)
+                try:
+                    interp_values = self.interpolate(alpha_vec)
+                    self.ax.plot(alpha_vec, interp_values, 'g-', linewidth=2, alpha=0.8, label='Spline Interpolation', zorder=2)
+                except Exception as e:
+                    # Fallback to linear if spline fails
+                    try:
+                        from scipy.interpolate import interp1d
+                        interp_func = interp1d(alphas, values, kind='linear', bounds_error=False, fill_value='extrapolate')
+                        interp_values = interp_func(alpha_vec)
+                        self.ax.plot(alpha_vec, interp_values, 'g--', linewidth=2, alpha=0.7, label='Linear Interpolation (fallback)', zorder=2)
+                    except:
+                        pass
+            
+            # Auto-scale y-axis only if not zoomed
+            if not is_zoomed:
+                if len(values) > 0:
+                    y_min, y_max = values.min(), values.max()
+                    y_range = y_max - y_min
+                    if y_range > 0:
+                        padding = y_range * 0.1
+                        self.ax.set_ylim(y_min - padding, y_max + padding)
+                    else:
+                        self.ax.set_ylim(y_min - 0.1, y_max + 0.1)
+                # Set x-axis limits
+                self.ax.set_xlim(self.alpha_range[0] - 1, self.alpha_range[1] + 1)
+            else:
+                # Restore zoom
+                self.ax.set_xlim(current_xlim)
+                self.ax.set_ylim(current_ylim)
+        
+        else:
+            # Initial view
+            self.ax.set_xlim(self.alpha_range[0] - 1, self.alpha_range[1] + 1)
+        
+        self.ax.legend(loc='best')
+    
+    def interpolate(self, alpha_vector):
+        """Interpolate values for given alpha vector using splines."""
+        if len(self.points) == 0:
+            raise ValueError("No points have been added. Please add at least one point.")
+        
+        alphas = np.array([p[0] for p in self.points])
+        values = np.array([p[1] for p in self.points])
+        
+        # Sort by alpha
+        sort_idx = np.argsort(alphas)
+        alphas = alphas[sort_idx]
+        values = values[sort_idx]
+        
+        alpha_vector = np.array(alpha_vector)
+        
+        # If only one point, return constant value
+        if len(self.points) == 1:
+            return np.full_like(alpha_vector, values[0])
+        
+        # Use cubic spline interpolation
+        # s=0 means interpolation (passes through all points)
+        # For smoothing, increase s (e.g., s=len(alphas) for moderate smoothing)
+        try:
+            # Try cubic spline first (k=3)
+            spline = UnivariateSpline(alphas, values, s=self.spline_smoothing, k=min(3, len(alphas)-1))
+            interpolated = spline(alpha_vector)
+        except:
+            # If cubic fails (e.g., too few points), fall back to linear
+            interp_func = interp1d(alphas, values, kind='linear', 
+                                  bounds_error=False, fill_value='extrapolate')
+            interpolated = interp_func(alpha_vector)
+        
+        return interpolated
+    
+    def show(self):
+        """Show the plot and wait for user to finish."""
+        print(f"\nInteractive plot: {self.title}")
+        print("Instructions:")
+        print("  - Left-click to add points")
+        print("  - Right-click or middle-click to zoom/pan (use toolbar)")
+        print("  - Press 'd' to delete last point")
+        print("  - Press 'c' to clear all points")
+        print("  - Press 'r' to reset zoom")
+        print("  - Press 'q' or close window when done")
+        print(f"  Current points: {len(self.points)}")
+        print("  Using cubic spline interpolation")
+        
+        # Ensure toolbar is visible for zoom/pan
+        try:
+            # Try to show toolbar (works for most backends)
+            if hasattr(self.fig.canvas, 'toolbar') and self.fig.canvas.toolbar:
+                self.fig.canvas.toolbar.update()
+        except:
+            pass
+        
+        # Use block=True to wait for window to close
+        plt.show(block=True)
+        return self
+
+
 def get_user_input():
     """Get all user inputs interactively."""
     print("="*60)
@@ -412,23 +623,27 @@ def get_user_input():
     alpha = create_alpha_vector(a_min, a_max, increment)
     print(f"   Generated {len(alpha)} angles from {a_min} to {a_max} deg (increment: {increment})")
     
-    # Get Cl vector
-    print("\n3. Enter Cl vector (lift coefficient):")
-    print(f"   Enter {len(alpha)} values separated by commas or spaces:")
-    cl_str = input("   Cl values: ")
-    cl = np.array([float(x.strip()) for x in cl_str.replace(',', ' ').split()])
+    # Get Cl vector using interactive plot
+    print("\n3. Enter Cl values (lift coefficient) - Interactive Plot")
+    cl_plot = InteractivePlot("Cl vs Angle of Attack", "Angle of Attack (deg)", "Cl", (a_min, a_max))
+    cl_plot.show()
     
-    if len(cl) != len(alpha):
-        raise ValueError(f"Cl vector length ({len(cl)}) doesn't match alpha length ({len(alpha)})")
+    if len(cl_plot.points) == 0:
+        raise ValueError("No Cl points were added. Please add at least one point.")
     
-    # Get Cl/Cd vector
-    print("\n4. Enter Cl/Cd vector (lift-to-drag ratio):")
-    print(f"   Enter {len(alpha)} values separated by commas or spaces:")
-    cl_cd_str = input("   Cl/Cd values: ")
-    cl_cd = np.array([float(x.strip()) for x in cl_cd_str.replace(',', ' ').split()])
+    cl = cl_plot.interpolate(alpha)
+    print(f"   Interpolated {len(cl)} Cl values from {len(cl_plot.points)} points")
     
-    if len(cl_cd) != len(alpha):
-        raise ValueError(f"Cl/Cd vector length ({len(cl_cd)}) doesn't match alpha length ({len(alpha)})")
+    # Get Cl/Cd vector using interactive plot
+    print("\n4. Enter Cl/Cd values (lift-to-drag ratio) - Interactive Plot")
+    cl_cd_plot = InteractivePlot("Cl/Cd vs Angle of Attack", "Angle of Attack (deg)", "Cl/Cd", (a_min, a_max))
+    cl_cd_plot.show()
+    
+    if len(cl_cd_plot.points) == 0:
+        raise ValueError("No Cl/Cd points were added. Please add at least one point.")
+    
+    cl_cd = cl_cd_plot.interpolate(alpha)
+    print(f"   Interpolated {len(cl_cd)} Cl/Cd values from {len(cl_cd_plot.points)} points")
     
     # Compute Cd from Cl and Cl/Cd
     cd = compute_cd_from_cl_clcd(cl, cl_cd)
