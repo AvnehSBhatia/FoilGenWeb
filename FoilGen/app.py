@@ -419,4 +419,4 @@ def api_download_dat():
         return jsonify({'error': 'No airfoil file generated yet'}), 404
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=8090)
+    app.run(debug=True, host='0.0.0.0', port=8080)
