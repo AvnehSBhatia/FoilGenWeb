@@ -251,14 +251,14 @@ def api_generate_airfoil():
         min_thickness = float(data['min_thickness'])
         max_thickness = float(data['max_thickness'])
         
-        # Compute Cd and statistics
+        # Compute Cd and statistics (for model input, we still use user input)
         cd = compute_cd_from_cl_clcd(cl, cl_cd)
-        stats = compute_summary_statistics(alpha, cl, cd, cl_cd)
+        user_stats = compute_summary_statistics(alpha, cl, cd, cl_cd)
         
-        # Create feature dictionary
+        # Create feature dictionary (using user input stats for model)
         feature_dict = create_feature_dict(
             Re, Mach, alpha, cl, cd, cl_cd,
-            min_thickness, max_thickness, stats
+            min_thickness, max_thickness, user_stats
         )
         
         # Run pipeline
@@ -271,6 +271,7 @@ def api_generate_airfoil():
         nf_cl_arr = None
         nf_cd_arr = None
         nf_ld_arr = None
+        nf_stats = None
         if NEURALFOIL_AVAILABLE:
             try:
                 coordinates = np.column_stack([pred_x, pred_y])
@@ -308,6 +309,15 @@ def api_generate_airfoil():
                 nf_cl_arr = np.array(nf_cl_list)
                 nf_cd_arr = np.array(nf_cd_list)
                 nf_ld_arr = np.array(nf_ld_list)
+                
+                # Compute stats from NeuralFoil results (filtering out NaN values)
+                valid_mask = ~(np.isnan(nf_cl_arr) | np.isnan(nf_cd_arr) | np.isnan(nf_ld_arr))
+                if np.sum(valid_mask) > 0:
+                    nf_alpha_valid = np.array(alpha)[valid_mask]
+                    nf_cl_valid = nf_cl_arr[valid_mask]
+                    nf_cd_valid = nf_cd_arr[valid_mask]
+                    nf_ld_valid = nf_ld_arr[valid_mask]
+                    nf_stats = compute_summary_statistics(nf_alpha_valid, nf_cl_valid, nf_cd_valid, nf_ld_valid)
             except Exception as e:
                 print(f"NeuralFoil analysis failed: {e}")
         
@@ -388,17 +398,20 @@ def api_generate_airfoil():
             for x, y in zip(pred_x, pred_y):
                 f.write(f"{x:.6f} {y:.6f}\n")
         
+        # Use NeuralFoil stats if available, otherwise fall back to user input stats
+        display_stats = nf_stats if nf_stats is not None else user_stats
+        
         return jsonify({
             'success': True,
             'x_coords': pred_x.tolist(),
             'y_coords': pred_y.tolist(),
             'stats': {
-                'clmax': float(stats['clmax']),
-                'cdmin': float(stats['cdmin']),
-                'ldmax': float(stats['ldmax']),
-                'alpha_clmax': float(stats['alpha_clmax']),
-                'alpha_cdmin': float(stats['alpha_cdmin']),
-                'alpha_ldmax': float(stats['alpha_ldmax'])
+                'clmax': float(display_stats['clmax']),
+                'cdmin': float(display_stats['cdmin']),
+                'ldmax': float(display_stats['ldmax']),
+                'alpha_clmax': float(display_stats['alpha_clmax']),
+                'alpha_cdmin': float(display_stats['alpha_cdmin']),
+                'alpha_ldmax': float(display_stats['alpha_ldmax'])
             },
             'plots': {
                 'airfoil_shape': airfoil_plot_b64,
