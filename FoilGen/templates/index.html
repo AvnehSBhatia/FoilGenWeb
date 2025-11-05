@@ -85,17 +85,21 @@
                 <button class="btn btn-primary" onclick="interpolateClCd()">Update Interpolation</button>
             </section>
 
-            <!-- Step 5: Thickness -->
+            <!-- Step 5: Thickness Range -->
             <section class="card" id="step5">
-                <h2>5. Airfoil Thickness</h2>
+                <h2>5. Thickness Search Range</h2>
+                <p class="help-text">The optimization will automatically test different thickness combinations to find the best airfoil. Specify the range of maximum thickness values to search (in 0.01 increments). For each maximum thickness tested, the system will also try all minimum thickness values from 0.01 up to half of that maximum thickness.</p>
+                <p class="help-text"><strong>Example:</strong> If you set 0.10 to 0.20, it will test max thicknesses of 0.10, 0.11, 0.12... up to 0.20. For max thickness 0.20, it will test min thicknesses of 0.01, 0.02, 0.03... up to 0.10 (half of 0.20).</p>
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="min-thickness">Minimum Thickness (chord fraction)</label>
-                        <input type="number" id="min-thickness" step="0.001" value="0.08" placeholder="e.g., 0.08">
+                        <label for="max-thickness-min">Maximum Thickness - Minimum (chord fraction)</label>
+                        <input type="number" id="max-thickness-min" step="0.01" value="0.10" placeholder="e.g., 0.10">
+                        <small class="help-text">Lowest maximum thickness to test</small>
                     </div>
                     <div class="form-group">
-                        <label for="max-thickness">Maximum Thickness (chord fraction)</label>
-                        <input type="number" id="max-thickness" step="0.001" value="0.12" placeholder="e.g., 0.12">
+                        <label for="max-thickness-max">Maximum Thickness - Maximum (chord fraction)</label>
+                        <input type="number" id="max-thickness-max" step="0.01" value="0.20" placeholder="e.g., 0.20">
+                        <small class="help-text">Highest maximum thickness to test</small>
                     </div>
                 </div>
             </section>
@@ -103,12 +107,35 @@
             <!-- Step 6: Generate -->
             <section class="card" id="step6">
                 <h2>6. Generate Airfoil</h2>
-                <button class="btn btn-success btn-large" onclick="generateAirfoil()">
+                <button class="btn btn-success btn-large" onclick="generateAirfoil()" id="generate-btn">
                     Generate Airfoil
                 </button>
+                <div id="optimization-status" style="display: none;">
+                    <div class="progress-container">
+                        <div class="progress-header">
+                            <h3>Optimizing Airfoil</h3>
+                            <span id="progress-text">0%</span>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progress-fill"></div>
+                        </div>
+                        <div class="progress-details">
+                            <p id="progress-details-text">Initializing...</p>
+                        </div>
+                    </div>
+                    <div class="best-airfoil-preview">
+                        <h3>Current Best Airfoil</h3>
+                        <img id="best-airfoil-preview-img" src="" alt="Best Airfoil Preview" style="display: none;">
+                        <div id="best-airfoil-stats" style="display: none;">
+                            <p><strong>Max Thickness:</strong> <span id="best-max-thickness"></span></p>
+                            <p><strong>Min Thickness:</strong> <span id="best-min-thickness"></span></p>
+                            <p><strong>Error:</strong> <span id="best-error"></span></p>
+                        </div>
+                    </div>
+                </div>
                 <div id="loading" class="loading" style="display: none;">
                     <div class="spinner"></div>
-                    <p>Generating airfoil...</p>
+                    <p>Finalizing results...</p>
                 </div>
                 <div id="error" class="error-box" style="display: none;"></div>
             </section>

@@ -607,21 +607,34 @@ async function generateAirfoil() {
         return;
     }
     
-    const minThickness = parseFloat(document.getElementById('min-thickness').value);
-    const maxThickness = parseFloat(document.getElementById('max-thickness').value);
+    const maxThicknessMin = parseFloat(document.getElementById('max-thickness-min').value);
+    const maxThicknessMax = parseFloat(document.getElementById('max-thickness-max').value);
     
-    if (!minThickness || !maxThickness) {
-        showError('Please enter thickness values');
+    if (!maxThicknessMin || !maxThicknessMax || maxThicknessMin >= maxThicknessMax) {
+        showError('Please enter valid max thickness range (min < max)');
         return;
     }
     
-    // Show loading
-    document.getElementById('loading').style.display = 'flex';
+    // Disable generate button
+    const generateBtn = document.getElementById('generate-btn');
+    generateBtn.disabled = true;
+    generateBtn.textContent = 'Optimizing...';
+    
+    // Show optimization status, hide results
+    document.getElementById('optimization-status').style.display = 'block';
+    document.getElementById('loading').style.display = 'none';
     document.getElementById('error').style.display = 'none';
     document.getElementById('results').style.display = 'none';
     
+    // Reset progress
+    document.getElementById('progress-fill').style.width = '0%';
+    document.getElementById('progress-text').textContent = '0%';
+    document.getElementById('progress-details-text').textContent = 'Initializing...';
+    document.getElementById('best-airfoil-preview-img').style.display = 'none';
+    document.getElementById('best-airfoil-stats').style.display = 'none';
+    
     try {
-        const response = await fetch(`${API_BASE}/api/generate_airfoil`, {
+        const response = await fetch(`${API_BASE}/api/optimize_airfoil`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -630,36 +643,96 @@ async function generateAirfoil() {
                 alpha: state.alpha,
                 cl: state.clInterpolated,
                 cl_cd: state.clCdInterpolated,
-                min_thickness: minThickness,
-                max_thickness: maxThickness
+                max_thickness_min: maxThicknessMin,
+                max_thickness_max: maxThicknessMax
             })
         });
         
-        const data = await response.json();
-        
-        if (data.error) {
-            throw new Error(data.error);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
         }
         
-        // Display results
-        document.getElementById('stat-clmax').textContent = formatNumber(data.stats.clmax);
-        document.getElementById('stat-clmax-alpha').textContent = `at α = ${data.stats.alpha_clmax.toFixed(2)}°`;
-        document.getElementById('stat-cdmin').textContent = formatNumber(data.stats.cdmin);
-        document.getElementById('stat-cdmin-alpha').textContent = `at α = ${data.stats.alpha_cdmin.toFixed(2)}°`;
-        document.getElementById('stat-ldmax').textContent = formatNumber(data.stats.ldmax);
-        document.getElementById('stat-ldmax-alpha').textContent = `at α = ${data.stats.alpha_ldmax.toFixed(2)}°`;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
         
-        document.getElementById('airfoil-plot').src = 'data:image/png;base64,' + data.plots.airfoil_shape;
-        document.getElementById('curves-plot').src = 'data:image/png;base64,' + data.plots.aerodynamic_curves;
-        
-        document.getElementById('results').style.display = 'block';
-        document.getElementById('results').scrollIntoView({ behavior: 'smooth' });
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // Keep incomplete line in buffer
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        
+                        if (data.type === 'progress') {
+                            // Update progress bar
+                            const progress = Math.min(100, Math.max(0, data.progress));
+                            document.getElementById('progress-fill').style.width = progress + '%';
+                            document.getElementById('progress-text').textContent = progress.toFixed(1) + '%';
+                            document.getElementById('progress-details-text').textContent = 
+                                `Iteration ${data.iteration} of ${data.total} | Testing: Max=${data.current_max_t.toFixed(3)}, Min=${data.current_min_t.toFixed(3)} | Best Error: ${data.best_error.toFixed(6)}`;
+                            
+                            // Update best airfoil preview if new best found
+                            if (data.best_airfoil_plot) {
+                                const previewImg = document.getElementById('best-airfoil-preview-img');
+                                previewImg.src = 'data:image/png;base64,' + data.best_airfoil_plot;
+                                previewImg.style.display = 'block';
+                                
+                                const statsDiv = document.getElementById('best-airfoil-stats');
+                                document.getElementById('best-max-thickness').textContent = data.best_max_t.toFixed(3);
+                                document.getElementById('best-min-thickness').textContent = data.best_min_t.toFixed(3);
+                                document.getElementById('best-error').textContent = data.best_error.toFixed(6);
+                                statsDiv.style.display = 'block';
+                            }
+                        } else if (data.type === 'complete') {
+                            if (data.success) {
+                                // Show loading for final processing
+                                document.getElementById('loading').style.display = 'flex';
+                                
+                                // Display final results
+                                if (data.stats && Object.keys(data.stats).length > 0) {
+                                    document.getElementById('stat-clmax').textContent = formatNumber(data.stats.clmax);
+                                    document.getElementById('stat-clmax-alpha').textContent = `at α = ${data.stats.alpha_clmax.toFixed(2)}°`;
+                                    document.getElementById('stat-cdmin').textContent = formatNumber(data.stats.cdmin);
+                                    document.getElementById('stat-cdmin-alpha').textContent = `at α = ${data.stats.alpha_cdmin.toFixed(2)}°`;
+                                    document.getElementById('stat-ldmax').textContent = formatNumber(data.stats.ldmax);
+                                    document.getElementById('stat-ldmax-alpha').textContent = `at α = ${data.stats.alpha_ldmax.toFixed(2)}°`;
+                                }
+                                
+                                document.getElementById('airfoil-plot').src = 'data:image/png;base64,' + data.plots.airfoil_shape;
+                                document.getElementById('curves-plot').src = 'data:image/png;base64,' + data.plots.aerodynamic_curves;
+                                
+                                document.getElementById('results').style.display = 'block';
+                                document.getElementById('results').scrollIntoView({ behavior: 'smooth' });
+                                
+                                // Hide optimization status
+                                document.getElementById('optimization-status').style.display = 'none';
+                                document.getElementById('loading').style.display = 'none';
+                            } else {
+                                throw new Error(data.error || 'Optimization failed');
+                            }
+                        } else if (data.type === 'error') {
+                            throw new Error(data.error);
+                        }
+                    } catch (e) {
+                        console.error('Error parsing SSE data:', e, line);
+                    }
+                }
+            }
+        }
         
         hideError();
     } catch (error) {
-        showError('Error generating airfoil: ' + error.message);
+        showError('Error optimizing airfoil: ' + error.message);
+        document.getElementById('optimization-status').style.display = 'none';
     } finally {
-        document.getElementById('loading').style.display = 'none';
+        generateBtn.disabled = false;
+        generateBtn.textContent = 'Generate Airfoil';
     }
 }
 

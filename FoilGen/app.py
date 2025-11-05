@@ -1,7 +1,7 @@
 """
 Flask Web Application for Interactive Airfoil Design
 """
-from flask import Flask, render_template, request, jsonify, send_file
+from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 import torch
 import torch.nn as nn
 import numpy as np
@@ -421,6 +421,310 @@ def api_generate_airfoil():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+def generate_and_evaluate_airfoil(Re, Mach, alpha, cl_target, cl_cd_target, min_thickness, max_thickness):
+    """
+    Generate an airfoil and evaluate its error against target curves.
+    
+    Returns:
+        (pred_x, pred_y, nf_cl_arr, nf_cd_arr, nf_ld_arr, error, airfoil_plot_b64)
+    """
+    # Compute Cd and statistics
+    cd_target = compute_cd_from_cl_clcd(cl_target, cl_cd_target)
+    user_stats = compute_summary_statistics(alpha, cl_target, cd_target, cl_cd_target)
+    
+    # Create feature dictionary
+    feature_dict = create_feature_dict(
+        Re, Mach, alpha, cl_target, cd_target, cl_cd_target,
+        min_thickness, max_thickness, user_stats
+    )
+    
+    # Run pipeline
+    pred_x, pred_y = run_pipeline(
+        aero_model, af512_to_xy_model, feature_dict,
+        normalization_data, device=device
+    )
+    
+    # Generate airfoil shape plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(pred_x, pred_y, 'b-', linewidth=2)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel('X (chord fraction)')
+    ax.set_ylabel('Y (chord fraction)')
+    ax.set_title('Generated Airfoil Shape')
+    plt.tight_layout()
+    
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format='png', dpi=150, bbox_inches='tight')
+    img_buf.seek(0)
+    airfoil_plot_b64 = base64.b64encode(img_buf.read()).decode()
+    plt.close()
+    
+    # Run NeuralFoil analysis if available
+    nf_cl_arr = None
+    nf_cd_arr = None
+    nf_ld_arr = None
+    error = float('inf')
+    
+    if NEURALFOIL_AVAILABLE:
+        try:
+            coordinates = np.column_stack([pred_x, pred_y])
+            nf_cl_list = []
+            nf_cd_list = []
+            nf_ld_list = []
+            
+            for alpha_val in alpha:
+                try:
+                    nf_results = nf.get_aero_from_coordinates(
+                        coordinates=coordinates,
+                        alpha=float(alpha_val),
+                        Re=Re,
+                        model_size="xxxlarge"
+                    )
+                    
+                    pred_cl = nf_results['CL']
+                    pred_cd = nf_results['CD']
+                    
+                    if isinstance(pred_cl, np.ndarray):
+                        pred_cl = float(pred_cl[0])
+                    if isinstance(pred_cd, np.ndarray):
+                        pred_cd = float(pred_cd[0])
+                    
+                    pred_ld = pred_cl / pred_cd if pred_cd > 0 else 0
+                    
+                    nf_cl_list.append(pred_cl)
+                    nf_cd_list.append(pred_cd)
+                    nf_ld_list.append(pred_ld)
+                except:
+                    nf_cl_list.append(np.nan)
+                    nf_cd_list.append(np.nan)
+                    nf_ld_list.append(np.nan)
+            
+            nf_cl_arr = np.array(nf_cl_list)
+            nf_cd_arr = np.array(nf_cd_list)
+            nf_ld_arr = np.array(nf_ld_list)
+            
+            # Compute error: mean squared error between NeuralFoil results and target
+            # with Gaussian weighting around peaks
+            valid_mask = ~(np.isnan(nf_cl_arr) | np.isnan(nf_cd_arr))
+            if np.sum(valid_mask) > 0:
+                # Get alpha values for valid points
+                alpha_arr = np.array(alpha)
+                alpha_valid = alpha_arr[valid_mask]
+                
+                # Normalize errors by range of target values
+                cl_range = np.max(cl_target) - np.min(cl_target)
+                cl_cd_range = np.max(cl_cd_target) - np.min(cl_cd_target)
+                
+                # Find peaks (alpha where max occurs)
+                cl_peak_idx = np.argmax(cl_target)
+                cl_peak_alpha = alpha_arr[cl_peak_idx]
+                
+                ld_peak_idx = np.argmax(cl_cd_target)
+                ld_peak_alpha = alpha_arr[ld_peak_idx]
+                
+                # Compute Gaussian weights around peaks
+                # Use standard deviation based on alpha range (e.g., 1/4 of total range)
+                alpha_range = np.max(alpha_arr) - np.min(alpha_arr)
+                cl_sigma = alpha_range / 4.0  # Controls width of Gaussian
+                ld_sigma = alpha_range / 4.0
+                
+                # Gaussian weight function: exp(-0.5 * ((x - mu) / sigma)^2)
+                cl_weights = np.exp(-0.5 * ((alpha_valid - cl_peak_alpha) / cl_sigma) ** 2)
+                ld_weights = np.exp(-0.5 * ((alpha_valid - ld_peak_alpha) / ld_sigma) ** 2)
+                
+                # Normalize weights so they sum to number of points (for proper weighting)
+                cl_weights = cl_weights * len(cl_weights) / np.sum(cl_weights)
+                ld_weights = ld_weights * len(ld_weights) / np.sum(ld_weights)
+                
+                # Compute weighted MSE for Cl
+                cl_target_valid = cl_target[valid_mask]
+                nf_cl_valid = nf_cl_arr[valid_mask]
+                if cl_range > 0:
+                    cl_errors = ((nf_cl_valid - cl_target_valid) / cl_range) ** 2
+                else:
+                    cl_errors = (nf_cl_valid - cl_target_valid) ** 2
+                cl_error = np.mean(cl_errors * cl_weights)
+                
+                # Compute weighted MSE for L/D
+                nf_ld_valid = nf_ld_arr[valid_mask]
+                cl_cd_target_valid = cl_cd_target[valid_mask]
+                if cl_cd_range > 0:
+                    ld_errors = ((nf_ld_valid - cl_cd_target_valid) / cl_cd_range) ** 2
+                else:
+                    ld_errors = (nf_ld_valid - cl_cd_target_valid) ** 2
+                ld_error = np.mean(ld_errors * ld_weights)
+                
+                # Weighted combination: 50% Cl, 50% L/D
+                error = 0.5 * cl_error + 0.5 * ld_error
+        except Exception as e:
+            print(f"NeuralFoil analysis failed: {e}")
+    
+    return pred_x, pred_y, nf_cl_arr, nf_cd_arr, nf_ld_arr, error, airfoil_plot_b64
+
+@app.route('/api/optimize_airfoil', methods=['POST'])
+def api_optimize_airfoil():
+    """Optimize airfoil by testing different thickness combinations."""
+    if aero_model is None or af512_to_xy_model is None:
+        return jsonify({'error': 'Models not loaded'}), 500
+    
+    @stream_with_context
+    def generate():
+        try:
+            data = request.json
+            
+            # Extract inputs
+            Re = float(data['re'])
+            Mach = float(data['mach'])
+            alpha = np.array(data['alpha'])
+            cl_target = np.array(data['cl'])
+            cl_cd_target = np.array(data['cl_cd'])
+            max_thickness_min = float(data['max_thickness_min'])
+            max_thickness_max = float(data['max_thickness_max'])
+            
+            # Generate max thickness range (0.01 increments)
+            max_thicknesses = np.arange(max_thickness_min, max_thickness_max + 0.005, 0.01)
+            
+            # Calculate total iterations
+            total_iterations = 0
+            for max_t in max_thicknesses:
+                # For each max thickness, try min thickness from 0.01 to max_t/2
+                min_thicknesses = np.arange(0.01, max_t / 2 + 0.005, 0.01)
+                total_iterations += len(min_thicknesses)
+            
+            # Track best airfoil
+            best_error = float('inf')
+            best_pred_x = None
+            best_pred_y = None
+            best_nf_cl = None
+            best_nf_cd = None
+            best_nf_ld = None
+            best_airfoil_plot = None
+            best_min_t = None
+            best_max_t = None
+            
+            current_iteration = 0
+            
+            # Iterate over max thickness
+            for max_t in max_thicknesses:
+                # For each max thickness, try min thickness from 0.01 to max_t/2
+                min_thicknesses = np.arange(0.01, max_t / 2 + 0.005, 0.01)
+                
+                for min_t in min_thicknesses:
+                    current_iteration += 1
+                    progress = (current_iteration / total_iterations) * 100
+                    
+                    # Generate and evaluate airfoil
+                    try:
+                        pred_x, pred_y, nf_cl_arr, nf_cd_arr, nf_ld_arr, error, airfoil_plot = \
+                            generate_and_evaluate_airfoil(
+                                Re, Mach, alpha, cl_target, cl_cd_target, min_t, max_t
+                            )
+                        
+                        # Update best if this is better
+                        if error < best_error:
+                            best_error = error
+                            best_pred_x = pred_x
+                            best_pred_y = pred_y
+                            best_nf_cl = nf_cl_arr
+                            best_nf_cd = nf_cd_arr
+                            best_nf_ld = nf_ld_arr
+                            best_airfoil_plot = airfoil_plot
+                            best_min_t = min_t
+                            best_max_t = max_t
+                            
+                            # Send progress update with best airfoil
+                            yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'iteration': current_iteration, 'total': total_iterations, 'current_max_t': float(max_t), 'current_min_t': float(min_t), 'best_error': float(best_error), 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t), 'best_airfoil_plot': best_airfoil_plot})}\n\n"
+                        else:
+                            # Send progress update without updating best
+                            yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'iteration': current_iteration, 'total': total_iterations, 'current_max_t': float(max_t), 'current_min_t': float(min_t), 'best_error': float(best_error), 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t)})}\n\n"
+                    except Exception as e:
+                        print(f"Error generating airfoil at max_t={max_t}, min_t={min_t}: {e}")
+                        yield f"data: {json.dumps({'type': 'progress', 'progress': progress, 'iteration': current_iteration, 'total': total_iterations, 'error': str(e)})}\n\n"
+            
+            # Generate final plots with best airfoil
+            if best_pred_x is not None:
+                # Aerodynamic curves plot
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                
+                alpha_arr = np.array(alpha)
+                
+                # Cl vs alpha
+                axes[0].plot(alpha_arr, cl_target, 'b-o', label='Target', linewidth=2, markersize=4)
+                if best_nf_cl is not None:
+                    valid_mask = ~np.isnan(best_nf_cl)
+                    if np.sum(valid_mask) > 0:
+                        axes[0].plot(alpha_arr[valid_mask], best_nf_cl[valid_mask], 'r--s', 
+                                    label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
+                axes[0].set_xlabel('Angle of Attack (deg)')
+                axes[0].set_ylabel('Cl')
+                axes[0].set_title('Lift Coefficient vs AoA')
+                axes[0].legend()
+                axes[0].grid(True, alpha=0.3)
+                
+                # Cd vs alpha
+                cd_target = compute_cd_from_cl_clcd(cl_target, cl_cd_target)
+                axes[1].plot(alpha_arr, cd_target, 'r-o', label='Target', linewidth=2, markersize=4)
+                if best_nf_cd is not None:
+                    valid_mask = ~np.isnan(best_nf_cd)
+                    if np.sum(valid_mask) > 0:
+                        axes[1].plot(alpha_arr[valid_mask], best_nf_cd[valid_mask], 'b--s', 
+                                    label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
+                axes[1].set_xlabel('Angle of Attack (deg)')
+                axes[1].set_ylabel('Cd')
+                axes[1].set_title('Drag Coefficient vs AoA')
+                axes[1].legend()
+                axes[1].grid(True, alpha=0.3)
+                
+                # Cl/Cd vs alpha
+                axes[2].plot(alpha_arr, cl_cd_target, 'g-o', label='Target', linewidth=2, markersize=4)
+                if best_nf_ld is not None:
+                    valid_mask = ~np.isnan(best_nf_ld)
+                    if np.sum(valid_mask) > 0:
+                        axes[2].plot(alpha_arr[valid_mask], best_nf_ld[valid_mask], 'm--s', 
+                                    label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
+                axes[2].set_xlabel('Angle of Attack (deg)')
+                axes[2].set_ylabel('Cl/Cd')
+                axes[2].set_title('Lift-to-Drag Ratio vs AoA')
+                axes[2].legend()
+                axes[2].grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                img_buf = io.BytesIO()
+                plt.savefig(img_buf, format='png', dpi=150, bbox_inches='tight')
+                img_buf.seek(0)
+                curves_plot_b64 = base64.b64encode(img_buf.read()).decode()
+                plt.close()
+                
+                # Compute stats from NeuralFoil results
+                nf_stats = None
+                if best_nf_cl is not None and best_nf_cd is not None and best_nf_ld is not None:
+                    valid_mask = ~(np.isnan(best_nf_cl) | np.isnan(best_nf_cd) | np.isnan(best_nf_ld))
+                    if np.sum(valid_mask) > 0:
+                        nf_alpha_valid = alpha_arr[valid_mask]
+                        nf_cl_valid = best_nf_cl[valid_mask]
+                        nf_cd_valid = best_nf_cd[valid_mask]
+                        nf_ld_valid = best_nf_ld[valid_mask]
+                        nf_stats = compute_summary_statistics(nf_alpha_valid, nf_cl_valid, nf_cd_valid, nf_ld_valid)
+                
+                # Save .dat file
+                os.makedirs('output', exist_ok=True)
+                dat_path = os.path.join('output', 'generated_airfoil.dat')
+                with open(dat_path, 'w') as f:
+                    f.write("Generated Airfoil\n")
+                    for x, y in zip(best_pred_x, best_pred_y):
+                        f.write(f"{x:.6f} {y:.6f}\n")
+                
+                # Send final result
+                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'x_coords': best_pred_x.tolist(), 'y_coords': best_pred_y.tolist(), 'stats': {k: float(v) for k, v in (nf_stats or {}).items()}, 'plots': {'airfoil_shape': best_airfoil_plot, 'aerodynamic_curves': curves_plot_b64}, 'best_max_t': float(best_max_t), 'best_min_t': float(best_min_t), 'best_error': float(best_error)})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'complete', 'success': False, 'error': 'No valid airfoil generated'})}\n\n"
+        
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+    
+    return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/api/download_dat', methods=['GET'])
 def api_download_dat():
