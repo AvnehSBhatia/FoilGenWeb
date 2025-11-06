@@ -185,6 +185,31 @@ def collate_fn(batch):
     }, targets_batch
 
 
+class CorrectionNet(nn.Module):
+    """Correction model that takes predicted AF512 + errors and outputs corrected AF512."""
+    def __init__(self, af512_size=1024, error_size=11, output_size=1024, hidden_sizes=[512, 512, 512]):
+        super(CorrectionNet, self).__init__()
+        
+        input_size = af512_size + error_size
+        
+        layers = []
+        prev_size = input_size
+        
+        for hidden_size in hidden_sizes:
+            layers.extend([
+                nn.Linear(prev_size, hidden_size),
+                nn.LeakyReLU(),
+            ])
+            prev_size = hidden_size
+        
+        layers.append(nn.Linear(prev_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x)
+
+
 class AF512toXYNet(nn.Module):
     
     def __init__(self, input_size=1024, output_size=2048, hidden_sizes=[256, 256, 256, 256]):
@@ -349,6 +374,32 @@ def load_dat_file(filepath, num_points=512):
     except Exception as e:
         print(f"Error loading .dat file: {e}")
         return None, None
+
+
+def af512_to_coordinates(af512_data):
+    """
+    Convert AF512 format to x,y coordinates.
+    AF512 format: (num_points, 2) where first column is upper_y and second column is lower_y.
+    The x coordinates are uniformly distributed from 0 to 1.
+    
+    Args:
+        af512_data: Array of shape (num_points, 2) where columns are [upper_y, lower_y]
+    
+    Returns:
+        x_coords, y_coords: Arrays of x and y coordinates
+    """
+    num_points = af512_data.shape[0]
+    x_uniform = np.linspace(0, 1, num_points)
+    
+    upper_y = af512_data[:, 0]
+    lower_y = af512_data[:, 1]
+    
+    # Reconstruct full airfoil: upper surface from trailing edge (x=1) to leading edge (x=0),
+    # then lower surface from leading edge (x=0) back to trailing edge (x=1)
+    x_coords = np.concatenate([x_uniform[::-1], x_uniform[1:]])
+    y_coords = np.concatenate([upper_y[::-1], lower_y[1:]])
+    
+    return x_coords, y_coords
 
 
 # ============================================================================
@@ -531,13 +582,208 @@ def normalize_user_features(feature_dict, normalization_data):
     return normalized_features, min_vals, max_vals
 
 
-def run_pipeline(aero_model, af512_to_xy_model, feature_dict, normalization_data, device='cpu'):
+def compute_errors_for_correction(pred_af512_flat, feature_dict, normalization_data, device='cpu'):
     """
-    Run the full pipeline: User inputs → Aero → AF512 → XY coordinates.
+    Compute error statistics needed for correction model.
+    Returns error stats array (11 values) or None if NeuralFoil fails.
+    """
+    try:
+        import neuralfoil as nf
+    except ImportError:
+        return None
+    
+    try:
+        # Convert predicted AF512 to coordinates
+        pred_af512 = pred_af512_flat.reshape(512, 2)
+        pred_x, pred_y = af512_to_coordinates(pred_af512)
+        coordinates = np.column_stack([pred_x, pred_y])
+        
+        # Get Re and Mach (already unnormalized in feature_dict)
+        scalars = feature_dict['scalars']
+        norm_data = normalization_data
+        
+        # Scalars are unnormalized, so use directly
+        Re = float(scalars[0])
+        Mach = float(scalars[1])
+        
+        # Get alpha values from sequence
+        sequence = feature_dict['sequence']
+        alpha_values = sequence[:, 0]
+        
+        # Compute NeuralFoil values
+        from scipy.interpolate import interp1d
+        
+        cl_list = []
+        cd_list = []
+        ld_list = []
+        
+        for alpha in alpha_values:
+            try:
+                nf_results = nf.get_aero_from_coordinates(
+                    coordinates=coordinates,
+                    alpha=float(alpha),
+                    Re=float(Re),
+                    model_size="xxxlarge"
+                )
+                
+                pred_cl = nf_results['CL']
+                pred_cd = nf_results['CD']
+                
+                if isinstance(pred_cl, np.ndarray):
+                    pred_cl = float(pred_cl[0])
+                if isinstance(pred_cd, np.ndarray):
+                    pred_cd = float(pred_cd[0])
+                
+                pred_ld = pred_cl / pred_cd if pred_cd > 0 else 0
+                
+                cl_list.append(pred_cl)
+                cd_list.append(pred_cd)
+                ld_list.append(pred_ld)
+            except Exception:
+                cl_list.append(np.nan)
+                cd_list.append(np.nan)
+                ld_list.append(np.nan)
+        
+        nf_results_dict = {
+            'cl': np.array(cl_list),
+            'cd': np.array(cd_list),
+            'ld': np.array(ld_list)
+        }
+        
+        # Compute statistics from NeuralFoil results
+        valid_mask = ~(np.isnan(nf_results_dict['cl']) | np.isnan(nf_results_dict['cd']) | np.isnan(nf_results_dict['ld']))
+        if np.sum(valid_mask) == 0:
+            return None
+        
+        alpha_valid = alpha_values[valid_mask]
+        cl_valid = nf_results_dict['cl'][valid_mask]
+        cd_valid = nf_results_dict['cd'][valid_mask]
+        ld_valid = nf_results_dict['ld'][valid_mask]
+        
+        clmax_idx = np.argmax(cl_valid)
+        clmax = cl_valid[clmax_idx]
+        alpha_clmax = alpha_valid[clmax_idx]
+        
+        cdmin_idx = np.argmin(cd_valid)
+        cdmin = cd_valid[cdmin_idx]
+        alpha_cdmin = alpha_valid[cdmin_idx]
+        
+        ldmax_idx = np.argmax(ld_valid)
+        ldmax = ld_valid[ldmax_idx]
+        alpha_ldmax = alpha_valid[ldmax_idx]
+        
+        nf_stats = {
+            'clmax': clmax,
+            'cdmin': cdmin,
+            'ldmax': ldmax,
+            'alpha_clmax': alpha_clmax,
+            'alpha_cdmin': alpha_cdmin,
+            'alpha_ldmax': alpha_ldmax
+        }
+        
+        # Target statistics are already unnormalized in scalars
+        target_ldmax = float(scalars[2])
+        target_clmax = float(scalars[3])
+        target_cdmin = float(scalars[4])
+        target_alpha_clmax = float(scalars[5])
+        target_alpha_cdmin = float(scalars[6])
+        target_alpha_ldmax = float(scalars[7])
+        target_min_thickness = float(scalars[8])
+        target_max_thickness = float(scalars[9])
+        
+        # Compute errors
+        error_ldmax = nf_stats['ldmax'] - target_ldmax
+        error_clmax = nf_stats['clmax'] - target_clmax
+        error_cdmin = nf_stats['cdmin'] - target_cdmin
+        error_alpha_clmax = nf_stats['alpha_clmax'] - target_alpha_clmax
+        error_alpha_cdmin = nf_stats['alpha_cdmin'] - target_alpha_cdmin
+        error_alpha_ldmax = nf_stats['alpha_ldmax'] - target_alpha_ldmax
+        
+        # Compute thickness errors
+        min_x_idx = np.argmin(pred_x)
+        upper_x = pred_x[:min_x_idx+1]
+        upper_y = pred_y[:min_x_idx+1]
+        lower_x = pred_x[min_x_idx:]
+        lower_y = pred_y[min_x_idx:]
+        upper_x = upper_x[::-1]
+        upper_y = upper_y[::-1]
+        x_common = np.linspace(0, 1, 100)
+        upper_interp = interp1d(upper_x, upper_y, kind='linear', bounds_error=False, fill_value=np.nan)
+        lower_interp = interp1d(lower_x, lower_y, kind='linear', bounds_error=False, fill_value=np.nan)
+        upper_y_interp = upper_interp(x_common)
+        lower_y_interp = lower_interp(x_common)
+        thickness = upper_y_interp - lower_y_interp
+        valid_mask_thick = ~np.isnan(thickness)
+        if np.sum(valid_mask_thick) > 0:
+            thickness_valid = thickness[valid_mask_thick]
+            pred_min_thickness = np.min(thickness_valid)
+            pred_max_thickness = np.max(thickness_valid)
+        else:
+            pred_min_thickness = 0.0
+            pred_max_thickness = 0.0
+        
+        error_min_thickness = pred_min_thickness - target_min_thickness
+        error_max_thickness = pred_max_thickness - target_max_thickness
+        
+        # Compute sequence errors
+        target_cl = sequence[:, 1]
+        target_cd = sequence[:, 2]
+        target_cl_cd = sequence[:, 3]
+        
+        error_cl = nf_results_dict['cl'] - target_cl
+        error_cd = nf_results_dict['cd'] - target_cd
+        error_ld = nf_results_dict['ld'] - target_cl_cd
+        
+        # Create error stats array
+        error_stats = np.array([
+            error_ldmax,
+            error_clmax,
+            error_cdmin,
+            error_alpha_clmax,
+            error_alpha_cdmin,
+            error_alpha_ldmax,
+            error_min_thickness,
+            error_max_thickness,
+            np.nanmean(error_cl) if len(error_cl) > 0 else 0.0,
+            np.nanmean(error_cd) if len(error_cd) > 0 else 0.0,
+            np.nanmean(error_ld) if len(error_ld) > 0 else 0.0,
+        ], dtype=np.float32)
+        
+        return np.nan_to_num(error_stats, nan=0.0)
+    except Exception as e:
+        return None
+
+
+def apply_correction_model(correction_model, pred_af512_flat, error_stats, device='cpu'):
+    """Apply correction model to predicted AF512."""
+    if correction_model is None or error_stats is None:
+        return pred_af512_flat
+    
+    correction_model.eval()
+    with torch.no_grad():
+        # Concatenate AF512 and error stats
+        input_features = np.concatenate([pred_af512_flat, error_stats])
+        input_tensor = torch.FloatTensor(input_features).unsqueeze(0).to(device)
+        
+        # Get corrected AF512
+        corrected_af512 = correction_model(input_tensor)
+        corrected_af512_flat = corrected_af512.cpu().numpy().flatten()
+        
+        return corrected_af512_flat
+
+
+def run_pipeline(aero_model, af512_to_xy_model, feature_dict, normalization_data, 
+                 correction_model=None, device='cpu', return_uncorrected=False):
+    """
+    Run the full pipeline: User inputs → Aero → AF512 → [Correction] → XY coordinates.
     Optimized for fast inference on small hardware.
     
+    Args:
+        return_uncorrected: If True and correction is applied, also return uncorrected coordinates
+    
     Returns:
-        pred_x, pred_y: Predicted airfoil coordinates
+        pred_x, pred_y: Predicted airfoil coordinates (corrected if correction model available)
+        If return_uncorrected=True and correction was applied, also returns (uncorrected_x, uncorrected_y)
     """
     # Normalize features
     normalized_features, min_vals, max_vals = normalize_user_features(feature_dict, normalization_data)
@@ -563,9 +809,33 @@ def run_pipeline(aero_model, af512_to_xy_model, feature_dict, normalization_data
         # Re-enable gradients for other code
         torch.set_grad_enabled(True)
     
-    # Step 2: AF512 → XY
+    # Step 2: Get uncorrected XY first if correction model is available and requested
+    uncorrected_x = None
+    uncorrected_y = None
+    if return_uncorrected and correction_model is not None:
+        # Save uncorrected coordinates before any correction
+        uncorrected_x, uncorrected_y = predict_xy_coordinates(af512_to_xy_model, pred_af512_flat, device=device)
+    
+    # Step 3: Apply correction if available
+    correction_applied = False
+    if correction_model is not None:
+        error_stats = compute_errors_for_correction(
+            pred_af512_flat, feature_dict, normalization_data, device
+        )
+        if error_stats is not None:
+            corrected_af512 = apply_correction_model(
+                correction_model, pred_af512_flat, error_stats, device
+            )
+            pred_af512_flat = corrected_af512
+            correction_applied = True
+    
+    # Step 4: AF512 → XY
     pred_x, pred_y = predict_xy_coordinates(af512_to_xy_model, pred_af512_flat, device=device)
     
+    # Return both corrected and uncorrected if we have uncorrected data
+    # (even if correction wasn't applied, we still want to show comparison if correction model exists)
+    if return_uncorrected and uncorrected_x is not None:
+        return pred_x, pred_y, uncorrected_x, uncorrected_y
     return pred_x, pred_y
 
 
@@ -1304,7 +1574,7 @@ def main():
         user_data['alpha'], user_data['cl'], user_data['cd'], user_data['cl_cd'],
         save_path=os.path.join(output_dir, 'aerodynamic_curves.png'),
         nf_results=nf_results
-    )
+        )
     
     print("\n" + "="*60)
     print("All outputs saved to 'output' directory!")

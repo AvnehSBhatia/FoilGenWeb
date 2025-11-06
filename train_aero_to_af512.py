@@ -491,13 +491,20 @@ def predict_af512(model, scalars, sequence, device='mps'):
     """Predict AF512 from aerodynamic features."""
     model.eval()
     with torch.no_grad():
+        # Convert numpy arrays to tensors first
+        if not isinstance(scalars, torch.Tensor):
+            scalars = torch.FloatTensor(scalars)
+        if not isinstance(sequence, torch.Tensor):
+            sequence = torch.FloatTensor(sequence)
+        
+        # Add batch dimension if needed
         if scalars.ndim == 1:
             scalars = scalars.unsqueeze(0)
         if sequence.ndim == 2:
             sequence = sequence.unsqueeze(0)
         
-        scalars_tensor = torch.FloatTensor(scalars).to(device)
-        sequence_tensor = torch.FloatTensor(sequence).to(device)
+        scalars_tensor = scalars.to(device)
+        sequence_tensor = sequence.to(device)
         lengths = torch.tensor([sequence.shape[1]], dtype=torch.long).to(device)  # Can be on device, will convert to CPU in encoder if needed
         
         output = model(scalars_tensor, sequence_tensor, lengths)
@@ -575,6 +582,13 @@ def main():
     if features is None or len(features) == 0:
         print("No data loaded!")
         return
+    
+    # Use only the first half of the dataset
+    total_size = len(features)
+    half_size = total_size // 2
+    features = features[:half_size]
+    af512_data = af512_data[:half_size]
+    print(f"Using first half of dataset: {half_size} samples (out of {total_size} total)")
     
     # Normalize features
     features_normalized, min_vals, max_vals = normalize_features(features)

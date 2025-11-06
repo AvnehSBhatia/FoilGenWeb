@@ -191,7 +191,49 @@
             <section class="card results-section" id="results" style="display: none;">
                 <h2>Results</h2>
                 <div id="results-content">
-                    <div class="stats-grid">
+                    <div id="correction-comparison" style="display: none; margin-bottom: 20px; padding: 15px; background: #f0f9ff; border-radius: 8px; border-left: 4px solid #2563eb;">
+                        <h3 style="margin-top: 0; color: #2563eb;">Correction Model Comparison</h3>
+                        <p style="margin-bottom: 15px; color: #64748b;">Comparing corrected vs uncorrected predictions:</p>
+                        <div class="stats-grid" style="grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                            <div style="text-align: center;">
+                                <h4 style="margin: 0 0 10px 0; color: #dc2626;">Uncorrected</h4>
+                                <div class="stat-card" style="margin-bottom: 5px;">
+                                    <div class="stat-label">Cl Max</div>
+                                    <div class="stat-value" id="stat-clmax-uncorrected"></div>
+                                    <div class="stat-detail" id="stat-clmax-alpha-uncorrected"></div>
+                                </div>
+                                <div class="stat-card" style="margin-bottom: 5px;">
+                                    <div class="stat-label">Cd Min</div>
+                                    <div class="stat-value" id="stat-cdmin-uncorrected"></div>
+                                    <div class="stat-detail" id="stat-cdmin-alpha-uncorrected"></div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">L/D Max</div>
+                                    <div class="stat-value" id="stat-ldmax-uncorrected"></div>
+                                    <div class="stat-detail" id="stat-ldmax-alpha-uncorrected"></div>
+                                </div>
+                            </div>
+                            <div style="text-align: center;">
+                                <h4 style="margin: 0 0 10px 0; color: #10b981;">Corrected</h4>
+                                <div class="stat-card" style="margin-bottom: 5px;">
+                                    <div class="stat-label">Cl Max</div>
+                                    <div class="stat-value" id="stat-clmax-corrected"></div>
+                                    <div class="stat-detail" id="stat-clmax-alpha-corrected"></div>
+                                </div>
+                                <div class="stat-card" style="margin-bottom: 5px;">
+                                    <div class="stat-label">Cd Min</div>
+                                    <div class="stat-value" id="stat-cdmin-corrected"></div>
+                                    <div class="stat-detail" id="stat-cdmin-alpha-corrected"></div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-label">L/D Max</div>
+                                    <div class="stat-value" id="stat-ldmax-corrected"></div>
+                                    <div class="stat-detail" id="stat-ldmax-alpha-corrected"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="stats-grid" id="regular-stats">
                         <div class="stat-card">
                             <div class="stat-label">Cl Max</div>
                             <div class="stat-value" id="stat-clmax"></div>

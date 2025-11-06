@@ -25,6 +25,7 @@ from interactive_airfoil_design import (
     SequenceEncoder,
     AeroToAF512Net,
     AF512toXYNet,
+    CorrectionNet,
     predict_xy_coordinates,
     compute_reynolds_mach,
     bin_reynolds_number,
@@ -34,8 +35,12 @@ from interactive_airfoil_design import (
     compute_summary_statistics,
     create_feature_dict,
     normalize_user_features,
-    run_pipeline
+    run_pipeline,
+    af512_to_coordinates
 )
+
+# Correction model is available if CorrectionNet was imported successfully
+CORRECTION_MODEL_AVAILABLE = True
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'output'
@@ -64,6 +69,7 @@ except Exception as e:
 # Global model variables (loaded once on startup)
 aero_model = None
 af512_to_xy_model = None
+correction_model = None
 normalization_data = None
 device = None
 
@@ -76,7 +82,7 @@ optimization_cancelled = {}  # Track cancelled optimizations by request ID
 
 def load_models():
     """Load models once at startup with optimizations for small hardware."""
-    global aero_model, af512_to_xy_model, normalization_data, device
+    global aero_model, af512_to_xy_model, correction_model, normalization_data, device
     
     # Force CPU-only for deployment
     device = torch.device('cpu')
@@ -213,6 +219,42 @@ def load_models():
     
     norm_dict = np.load(norm_file, allow_pickle=True).item()
     normalization_data = norm_dict
+    
+    # Load correction model if available
+    if CORRECTION_MODEL_AVAILABLE:
+        correction_model_file = 'correction_model.pth'
+        if os.path.exists(correction_model_file):
+            print(f"Loading Correction model from {correction_model_file}...")
+            try:
+                correction_model = CorrectionNet(
+                    af512_size=1024,
+                    error_size=11,
+                    output_size=1024,
+                    hidden_sizes=[512, 512, 512]  # Match the architecture used during training
+                )
+                correction_model.load_state_dict(torch.load(correction_model_file, map_location='cpu'))
+                correction_model = correction_model.to(device)
+                correction_model.eval()
+                
+                # Try to apply quantization to correction model
+                try:
+                    correction_model = torch.quantization.quantize_dynamic(
+                        correction_model,
+                        {nn.Linear},
+                        dtype=torch.qint8
+                    )
+                    print("✓ Correction model loaded and quantized successfully")
+                except Exception as e:
+                    print(f"✓ Correction model loaded (quantization skipped: {e})")
+            except Exception as e:
+                print(f"⚠ Warning: Failed to load correction model: {e}")
+                correction_model = None
+        else:
+            print(f"⚠ Correction model file {correction_model_file} not found. Continuing without correction.")
+            correction_model = None
+    else:
+        print("⚠ Correction model not available (train_correction_model.py not found). Continuing without correction.")
+        correction_model = None
     
     print("✓ Models loaded and optimized successfully!")
 
@@ -554,7 +596,7 @@ def api_generate_airfoil():
         # Run pipeline
         pred_x, pred_y = run_pipeline(
             aero_model, af512_to_xy_model, feature_dict,
-            normalization_data, device=device
+            normalization_data, correction_model=correction_model, device=device
         )
         
         # Run NeuralFoil analysis if available
@@ -733,7 +775,7 @@ def generate_and_evaluate_airfoil(Re, Mach, alpha, cl_target, cl_cd_target, min_
     # Run pipeline
     pred_x, pred_y = run_pipeline(
         aero_model, af512_to_xy_model, feature_dict,
-        normalization_data, device=device
+        normalization_data, correction_model=correction_model, device=device
     )
     
     # Generate airfoil shape plot

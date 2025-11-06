@@ -23,6 +23,17 @@ from train_airfoil import (
     predict_xy_coordinates,
     load_dat_file
 )
+try:
+    from train_correction_model import (
+        CorrectionNet,
+        compute_neuralfoil_values,
+        compute_statistics,
+        compute_thickness
+    )
+    CORRECTION_MODEL_AVAILABLE = True
+except ImportError:
+    CORRECTION_MODEL_AVAILABLE = False
+    print("Warning: Correction model not available. Install train_correction_model.py")
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
@@ -98,19 +109,133 @@ def test_model(model, test_loader, device='mps', num_samples=10):
     }
 
 
+def compute_errors_for_correction(pred_af512_flat, feature_dict, normalization_data, device='cpu'):
+    """
+    Compute error statistics needed for correction model.
+    Returns error stats array (11 values) or None if NeuralFoil fails.
+    """
+    if not NEURALFOIL_AVAILABLE or not CORRECTION_MODEL_AVAILABLE:
+        return None
+    
+    try:
+        # Convert predicted AF512 to coordinates
+        # pred_af512_flat is (1024,) - need to reshape to (512, 2)
+        pred_af512 = pred_af512_flat.reshape(512, 2)
+        pred_x, pred_y = af512_to_coordinates(pred_af512)
+        coordinates = np.column_stack([pred_x, pred_y])
+        
+        # Denormalize Re and Mach
+        scalars = feature_dict['scalars']
+        norm_data = normalization_data
+        
+        re_norm = scalars[0]
+        re_min = norm_data['min'][0, 0]
+        re_max = norm_data['max'][0, 0]
+        re_range = re_max - re_min
+        Re = re_norm * re_range + re_min if re_range > 1e-6 else re_min
+        
+        # Get alpha values from sequence
+        sequence = feature_dict['sequence']
+        alpha_values = sequence[:, 0]
+        
+        # Compute NeuralFoil values
+        nf_results = compute_neuralfoil_values(coordinates, alpha_values, Re)
+        
+        # Compute statistics from NeuralFoil results
+        nf_stats = compute_statistics(alpha_values, nf_results['cl'], nf_results['cd'], nf_results['ld'])
+        if nf_stats is None:
+            return None
+        
+        # Denormalize target statistics
+        def denormalize(val, idx, norm_data):
+            min_val = norm_data['min'][0, idx]
+            max_val = norm_data['max'][0, idx]
+            range_val = max_val - min_val
+            return val * range_val + min_val if range_val > 1e-6 else min_val
+        
+        target_ldmax = denormalize(scalars[2], 2, norm_data)
+        target_clmax = denormalize(scalars[3], 3, norm_data)
+        target_cdmin = denormalize(scalars[4], 4, norm_data)
+        target_min_thickness = denormalize(scalars[8], 8, norm_data)
+        target_max_thickness = denormalize(scalars[9], 9, norm_data)
+        
+        # Compute errors
+        error_ldmax = nf_stats['ldmax'] - target_ldmax
+        error_clmax = nf_stats['clmax'] - target_clmax
+        error_cdmin = nf_stats['cdmin'] - target_cdmin
+        error_alpha_clmax = nf_stats['alpha_clmax'] - denormalize(scalars[5], 5, norm_data)
+        error_alpha_cdmin = nf_stats['alpha_cdmin'] - denormalize(scalars[6], 6, norm_data)
+        error_alpha_ldmax = nf_stats['alpha_ldmax'] - denormalize(scalars[7], 7, norm_data)
+        
+        # Compute thickness errors
+        pred_min_thickness, pred_max_thickness = compute_thickness(pred_x, pred_y)
+        error_min_thickness = pred_min_thickness - target_min_thickness
+        error_max_thickness = pred_max_thickness - target_max_thickness
+        
+        # Compute sequence errors
+        target_cl = sequence[:, 1]
+        target_cd = sequence[:, 2]
+        target_cl_cd = sequence[:, 3]
+        
+        error_cl = nf_results['cl'] - target_cl
+        error_cd = nf_results['cd'] - target_cd
+        error_ld = nf_results['ld'] - target_cl_cd
+        
+        # Create error stats array
+        error_stats = np.array([
+            error_ldmax,
+            error_clmax,
+            error_cdmin,
+            error_alpha_clmax,
+            error_alpha_cdmin,
+            error_alpha_ldmax,
+            error_min_thickness,
+            error_max_thickness,
+            np.nanmean(error_cl) if len(error_cl) > 0 else 0.0,
+            np.nanmean(error_cd) if len(error_cd) > 0 else 0.0,
+            np.nanmean(error_ld) if len(error_ld) > 0 else 0.0,
+        ], dtype=np.float32)
+        
+        return np.nan_to_num(error_stats, nan=0.0)
+    except Exception as e:
+        return None
+
+
+def apply_correction_model(correction_model, pred_af512_flat, error_stats, device='cpu'):
+    """Apply correction model to predicted AF512."""
+    if correction_model is None or error_stats is None:
+        return pred_af512_flat
+    
+    correction_model.eval()
+    with torch.no_grad():
+        # Concatenate AF512 and error stats
+        input_features = np.concatenate([pred_af512_flat, error_stats])
+        input_tensor = torch.FloatTensor(input_features).unsqueeze(0).to(device)
+        
+        # Get corrected AF512
+        corrected_af512 = correction_model(input_tensor)
+        corrected_af512_flat = corrected_af512.cpu().numpy().flatten()
+        
+        return corrected_af512_flat
+
+
 def visualize_predictions_full_pipeline(aero_model, af512_to_xy_model, test_features, test_xy_coords, 
+                                         correction_model=None, normalization_data=None,
                                          device='mps', num_samples=10, save_dir='test_results'):
-    """Visualize full pipeline: Aero → AF512 → XY vs ground truth XY coordinates."""
+    """Visualize full pipeline: Aero → AF512 → (Correction) → XY vs ground truth XY coordinates."""
     os.makedirs(save_dir, exist_ok=True)
     
     aero_model.eval()
     af512_to_xy_model.eval()
+    if correction_model is not None:
+        correction_model.eval()
     
     # Select random samples
     num_samples = min(num_samples, len(test_features))
     indices = np.random.choice(len(test_features), num_samples, replace=False)
     
-    print(f"Visualizing {num_samples} random samples (full pipeline)...")
+    use_correction = correction_model is not None and normalization_data is not None
+    print(f"Visualizing {num_samples} random samples (full pipeline{' with correction' if use_correction else ''})...")
     
     # Create subplots
     cols = 5
@@ -134,12 +259,12 @@ def visualize_predictions_full_pipeline(aero_model, af512_to_xy_model, test_feat
         gt_x = gt_xy[:1024]
         gt_y = gt_xy[1024:]
         
-        # Full pipeline: Aero → AF512 → XY
+        # Full pipeline: Aero → AF512 → (Correction) → XY
         feature_dict = test_features[idx]
         scalars = feature_dict['scalars']
         sequence = feature_dict['sequence']
         
-        # Step 1: Aero → AF512 (convert to tensors first)
+        # Step 1: Aero → AF512
         scalars_tensor = torch.FloatTensor(scalars).unsqueeze(0).to(device)
         sequence_tensor = torch.FloatTensor(sequence).unsqueeze(0).to(device)
         lengths_tensor = torch.tensor([len(sequence)], dtype=torch.long).to(device)
@@ -149,7 +274,15 @@ def visualize_predictions_full_pipeline(aero_model, af512_to_xy_model, test_feat
             pred_af512_tensor = aero_model(scalars_tensor, sequence_tensor, lengths_tensor)
             pred_af512_flat = pred_af512_tensor.cpu().numpy().flatten()
         
-        # Step 2: AF512 → XY
+        # Step 2: Apply correction if available
+        if use_correction:
+            error_stats = compute_errors_for_correction(pred_af512_flat, feature_dict, normalization_data, device)
+            if error_stats is not None:
+                corrected_af512_flat = apply_correction_model(correction_model, pred_af512_flat, error_stats, device)
+                # Use corrected AF512 for visualization
+                pred_af512_flat = corrected_af512_flat
+        
+        # Step 3: AF512 → XY
         pred_x, pred_y = predict_xy_coordinates(af512_to_xy_model, pred_af512_flat, device=device)
         
         # Calculate error in XY space
@@ -158,7 +291,7 @@ def visualize_predictions_full_pipeline(aero_model, af512_to_xy_model, test_feat
         
         # Plot
         ax.plot(gt_x, gt_y, 'b-', linewidth=2, label='Ground Truth', alpha=0.7)
-        ax.plot(pred_x, pred_y, 'r--', linewidth=2, label='Prediction', alpha=0.7)
+        ax.plot(pred_x, pred_y, 'r--', linewidth=2, label='Prediction' + (' (Corrected)' if use_correction else ''), alpha=0.7)
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.3)
         ax.set_title(f'Sample {i+1}\nXY MSE: {xy_mse:.6f}\nXY MAE: {xy_mae:.6f}')
@@ -180,17 +313,24 @@ def visualize_predictions_full_pipeline(aero_model, af512_to_xy_model, test_feat
     plt.close()
 
 
-def test_full_pipeline(aero_model, af512_to_xy_model, test_loader, test_xy_coords, device='mps'):
-    """Test the full pipeline: Aero → AF512 → XY and calculate metrics."""
+def test_full_pipeline(aero_model, af512_to_xy_model, test_loader, test_xy_coords, test_features,
+                       correction_model=None, normalization_data=None, device='mps'):
+    """Test the full pipeline: Aero → AF512 → (Correction) → XY and calculate metrics."""
     aero_model.eval()
     af512_to_xy_model.eval()
+    if correction_model is not None:
+        correction_model.eval()
     
     all_pred_xy = []
+    all_pred_xy_uncorrected = []
     all_gt_xy = []
     all_xy_mse = []
+    all_xy_mse_uncorrected = []
     all_xy_mae = []
+    all_xy_mae_uncorrected = []
     
-    print(f"Testing full pipeline on {len(test_loader.dataset)} samples...")
+    use_correction = correction_model is not None and normalization_data is not None
+    print(f"Testing full pipeline on {len(test_loader.dataset)} samples{' with correction' if use_correction else ''}...")
     
     with torch.no_grad():
         for batch_idx, (batch_data, _) in enumerate(tqdm(test_loader, desc="Testing pipeline")):
@@ -204,24 +344,50 @@ def test_full_pipeline(aero_model, af512_to_xy_model, test_loader, test_xy_coord
             # Step 2: AF512 → XY (process each sample in batch)
             batch_size = af512_outputs.shape[0]
             pred_xy_batch = []
+            pred_xy_uncorrected_batch = []
+            
+            start_idx = batch_idx * test_loader.batch_size
             
             for i in range(batch_size):
                 af512_flat = af512_outputs[i].cpu().numpy()
-                pred_x, pred_y = predict_xy_coordinates(af512_to_xy_model, af512_flat, device=device)
-                pred_xy = np.concatenate([pred_x, pred_y])
+                
+                # Get uncorrected XY first
+                pred_x_uncorrected, pred_y_uncorrected = predict_xy_coordinates(af512_to_xy_model, af512_flat, device=device)
+                pred_xy_uncorrected = np.concatenate([pred_x_uncorrected, pred_y_uncorrected])
+                pred_xy_uncorrected_batch.append(pred_xy_uncorrected)
+                
+                # Apply correction if available
+                if use_correction:
+                    feature_idx = start_idx + i
+                    if feature_idx < len(test_features):
+                        feature_dict = test_features[feature_idx]
+                        error_stats = compute_errors_for_correction(af512_flat, feature_dict, normalization_data, device)
+                        if error_stats is not None:
+                            corrected_af512_flat = apply_correction_model(correction_model, af512_flat, error_stats, device)
+                            pred_x, pred_y = predict_xy_coordinates(af512_to_xy_model, corrected_af512_flat, device=device)
+                            pred_xy = np.concatenate([pred_x, pred_y])
+                        else:
+                            # If correction fails, use uncorrected
+                            pred_xy = pred_xy_uncorrected
+                    else:
+                        pred_xy = pred_xy_uncorrected
+                else:
+                    pred_xy = pred_xy_uncorrected
+                
                 pred_xy_batch.append(pred_xy)
             
             pred_xy_batch = np.array(pred_xy_batch)
+            pred_xy_uncorrected_batch = np.array(pred_xy_uncorrected_batch)
             
             # Get corresponding ground truth XY
-            start_idx = batch_idx * test_loader.batch_size
             end_idx = min(start_idx + batch_size, len(test_xy_coords))
             gt_xy_batch = test_xy_coords[start_idx:end_idx]
             
             # Calculate errors
             for i in range(len(pred_xy_batch)):
-                pred_xy = pred_xy_batch[i]  # Shape: (2048,) - [x_coords (1024), y_coords (1024)]
-                gt_xy = gt_xy_batch[i]  # Shape: (2048,) - [x_coords (1024), y_coords (1024)]
+                pred_xy = pred_xy_batch[i]
+                pred_xy_uncorrected = pred_xy_uncorrected_batch[i]
+                gt_xy = gt_xy_batch[i]
                 
                 # Both should be flattened arrays of shape (2048,)
                 if gt_xy.ndim > 1:
@@ -230,17 +396,24 @@ def test_full_pipeline(aero_model, af512_to_xy_model, test_loader, test_xy_coord
                 # Ensure both are same length
                 min_len = min(len(pred_xy), len(gt_xy))
                 pred_xy = pred_xy[:min_len]
+                pred_xy_uncorrected = pred_xy_uncorrected[:min_len]
                 gt_xy = gt_xy[:min_len]
                 
                 xy_mse = np.mean((pred_xy - gt_xy) ** 2)
                 xy_mae = np.mean(np.abs(pred_xy - gt_xy))
+                xy_mse_uncorrected = np.mean((pred_xy_uncorrected - gt_xy) ** 2)
+                xy_mae_uncorrected = np.mean(np.abs(pred_xy_uncorrected - gt_xy))
                 
                 all_pred_xy.append(pred_xy)
+                all_pred_xy_uncorrected.append(pred_xy_uncorrected)
                 all_gt_xy.append(gt_xy)
                 all_xy_mse.append(xy_mse)
+                all_xy_mse_uncorrected.append(xy_mse_uncorrected)
                 all_xy_mae.append(xy_mae)
+                all_xy_mae_uncorrected.append(xy_mae_uncorrected)
     
     all_pred_xy = np.array(all_pred_xy)
+    all_pred_xy_uncorrected = np.array(all_pred_xy_uncorrected)
     all_gt_xy = np.array(all_gt_xy)
     
     # Calculate overall metrics
@@ -249,7 +422,7 @@ def test_full_pipeline(aero_model, af512_to_xy_model, test_loader, test_xy_coord
     overall_xy_rmse = np.sqrt(overall_xy_mse)
     
     print(f"\n{'='*60}")
-    print(f"Full Pipeline Test Results (Aero → AF512 → XY):")
+    print(f"Full Pipeline Test Results (Aero → AF512 → {'[Correction] → ' if use_correction else ''}XY):")
     print(f"{'='*60}")
     print(f"Total samples: {len(all_gt_xy)}")
     print(f"Mean XY MSE: {overall_xy_mse:.6f}")
@@ -258,9 +431,22 @@ def test_full_pipeline(aero_model, af512_to_xy_model, test_loader, test_xy_coord
     print(f"Std XY MSE: {np.std(all_xy_mse):.6f}")
     print(f"Best sample XY MSE: {np.min(all_xy_mse):.6f}")
     print(f"Worst sample XY MSE: {np.max(all_xy_mse):.6f}")
+    
+    if use_correction:
+        overall_xy_mse_uncorrected = np.mean(all_xy_mse_uncorrected)
+        overall_xy_mae_uncorrected = np.mean(all_xy_mae_uncorrected)
+        improvement_mse = ((overall_xy_mse_uncorrected - overall_xy_mse) / overall_xy_mse_uncorrected) * 100
+        improvement_mae = ((overall_xy_mae_uncorrected - overall_xy_mae) / overall_xy_mae_uncorrected) * 100
+        print(f"\nUncorrected Results:")
+        print(f"  Mean XY MSE: {overall_xy_mse_uncorrected:.6f}")
+        print(f"  Mean XY MAE: {overall_xy_mae_uncorrected:.6f}")
+        print(f"\nCorrection Improvement:")
+        print(f"  MSE improvement: {improvement_mse:.2f}%")
+        print(f"  MAE improvement: {improvement_mae:.2f}%")
+    
     print(f"{'='*60}\n")
     
-    return {
+    result = {
         'xy_mse': overall_xy_mse,
         'xy_mae': overall_xy_mae,
         'xy_rmse': overall_xy_rmse,
@@ -269,13 +455,20 @@ def test_full_pipeline(aero_model, af512_to_xy_model, test_loader, test_xy_coord
         'per_sample_mse': np.array(all_xy_mse),
         'per_sample_mae': np.array(all_xy_mae)
     }
+    
+    if use_correction:
+        result['predictions_uncorrected'] = all_pred_xy_uncorrected
+        result['xy_mse_uncorrected'] = overall_xy_mse_uncorrected
+        result['xy_mae_uncorrected'] = overall_xy_mae_uncorrected
+        result['per_sample_mse_uncorrected'] = np.array(all_xy_mse_uncorrected)
+        result['per_sample_mae_uncorrected'] = np.array(all_xy_mae_uncorrected)
+    
+    return result
 
 
 def visualize_error_distribution(results, save_dir='test_results'):
     """Visualize error distribution."""
     os.makedirs(save_dir, exist_ok=True)
-    
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     
     # Use xy_mse/xy_mae if available (from pipeline results), otherwise use mse/mae
     mse_key = 'xy_mse' if 'xy_mse' in results else 'mse'
@@ -283,23 +476,68 @@ def visualize_error_distribution(results, save_dir='test_results'):
     per_sample_mse_key = 'per_sample_mse'
     per_sample_mae_key = 'per_sample_mae'
     
-    # MSE distribution
-    axes[0].hist(results[per_sample_mse_key], bins=50, edgecolor='black', alpha=0.7)
-    axes[0].axvline(results[mse_key], color='r', linestyle='--', linewidth=2, label=f'Mean MSE: {results[mse_key]:.6f}')
-    axes[0].set_xlabel('MSE')
-    axes[0].set_ylabel('Frequency')
-    axes[0].set_title('MSE Distribution')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    has_uncorrected = 'per_sample_mse_uncorrected' in results
     
-    # MAE distribution
-    axes[1].hist(results[per_sample_mae_key], bins=50, edgecolor='black', alpha=0.7)
-    axes[1].axvline(results[mae_key], color='r', linestyle='--', linewidth=2, label=f'Mean MAE: {results[mae_key]:.6f}')
-    axes[1].set_xlabel('MAE')
-    axes[1].set_ylabel('Frequency')
-    axes[1].set_title('MAE Distribution')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
+    if has_uncorrected:
+        # Show both corrected and uncorrected
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # MSE distribution - corrected
+        axes[0, 0].hist(results[per_sample_mse_key], bins=50, edgecolor='black', alpha=0.7, label='Corrected', color='green')
+        axes[0, 0].axvline(results[mse_key], color='g', linestyle='--', linewidth=2, label=f'Mean: {results[mse_key]:.6f}')
+        axes[0, 0].set_xlabel('MSE')
+        axes[0, 0].set_ylabel('Frequency')
+        axes[0, 0].set_title('MSE Distribution (Corrected)')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # MSE distribution - uncorrected
+        axes[0, 1].hist(results['per_sample_mse_uncorrected'], bins=50, edgecolor='black', alpha=0.7, label='Uncorrected', color='red')
+        axes[0, 1].axvline(results['xy_mse_uncorrected'], color='r', linestyle='--', linewidth=2, label=f'Mean: {results["xy_mse_uncorrected"]:.6f}')
+        axes[0, 1].set_xlabel('MSE')
+        axes[0, 1].set_ylabel('Frequency')
+        axes[0, 1].set_title('MSE Distribution (Uncorrected)')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # MAE distribution - corrected
+        axes[1, 0].hist(results[per_sample_mae_key], bins=50, edgecolor='black', alpha=0.7, label='Corrected', color='green')
+        axes[1, 0].axvline(results[mae_key], color='g', linestyle='--', linewidth=2, label=f'Mean: {results[mae_key]:.6f}')
+        axes[1, 0].set_xlabel('MAE')
+        axes[1, 0].set_ylabel('Frequency')
+        axes[1, 0].set_title('MAE Distribution (Corrected)')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # MAE distribution - uncorrected
+        axes[1, 1].hist(results['per_sample_mae_uncorrected'], bins=50, edgecolor='black', alpha=0.7, label='Uncorrected', color='red')
+        axes[1, 1].axvline(results['xy_mae_uncorrected'], color='r', linestyle='--', linewidth=2, label=f'Mean: {results["xy_mae_uncorrected"]:.6f}')
+        axes[1, 1].set_xlabel('MAE')
+        axes[1, 1].set_ylabel('Frequency')
+        axes[1, 1].set_title('MAE Distribution (Uncorrected)')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+    else:
+        # Show only corrected/regular results
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # MSE distribution
+        axes[0].hist(results[per_sample_mse_key], bins=50, edgecolor='black', alpha=0.7)
+        axes[0].axvline(results[mse_key], color='r', linestyle='--', linewidth=2, label=f'Mean MSE: {results[mse_key]:.6f}')
+        axes[0].set_xlabel('MSE')
+        axes[0].set_ylabel('Frequency')
+        axes[0].set_title('MSE Distribution')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # MAE distribution
+        axes[1].hist(results[per_sample_mae_key], bins=50, edgecolor='black', alpha=0.7)
+        axes[1].axvline(results[mae_key], color='r', linestyle='--', linewidth=2, label=f'Mean MAE: {results[mae_key]:.6f}')
+        axes[1].set_xlabel('MAE')
+        axes[1].set_ylabel('Frequency')
+        axes[1].set_title('MAE Distribution')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
     save_path = os.path.join(save_dir, 'error_distribution.png')
@@ -783,6 +1021,37 @@ def main():
     af512_to_xy_model = af512_to_xy_model.to(device)
     print("AF512toXY model loaded successfully")
     
+    # Load correction model if available
+    correction_model = None
+    normalization_data = None
+    correction_model_file = 'correction_model.pth'
+    if CORRECTION_MODEL_AVAILABLE and os.path.exists(correction_model_file):
+        print(f"Loading Correction model from {correction_model_file}...")
+        correction_model = CorrectionNet(
+            af512_size=1024,
+            error_size=11,
+            output_size=1024,
+            hidden_sizes=[512, 512, 512]  # Match the architecture used during training
+        )
+        correction_model.load_state_dict(torch.load(correction_model_file, map_location=device))
+        correction_model = correction_model.to(device)
+        correction_model.eval()
+        print("Correction model loaded successfully")
+        
+        # Load normalization data for error computation
+        norm_file = 'feature_normalization.npy'
+        if os.path.exists(norm_file):
+            normalization_data = np.load(norm_file, allow_pickle=True).item()
+            print("Normalization data loaded successfully")
+        else:
+            print(f"Warning: Normalization file {norm_file} not found. Correction model will not be used.")
+            correction_model = None
+    else:
+        if not CORRECTION_MODEL_AVAILABLE:
+            print("Correction model not available (train_correction_model.py not found)")
+        elif not os.path.exists(correction_model_file):
+            print(f"Correction model file {correction_model_file} not found. Continuing without correction.")
+    
     # Load data
     print("\nLoading test data...")
     features, af512_data = load_csv_data('unpacked_csv', 'bigfoil', num_points=512)
@@ -834,17 +1103,23 @@ def main():
     
     # Run full pipeline tests
     print("\n" + "="*60)
-    print("Testing Full Pipeline: Aero → AF512 → XY")
+    pipeline_name = "Aero → AF512"
+    if correction_model is not None:
+        pipeline_name += " → Correction"
+    pipeline_name += " → XY"
+    print(f"Testing Full Pipeline: {pipeline_name}")
     print("="*60)
     
     pipeline_results = test_full_pipeline(
-        aero_model, af512_to_xy_model, test_loader, test_xy_coords, device=device
+        aero_model, af512_to_xy_model, test_loader, test_xy_coords, test_features,
+        correction_model=correction_model, normalization_data=normalization_data, device=device
     )
     
     # Visualize results
     print("\nGenerating visualizations...")
     visualize_predictions_full_pipeline(
-        aero_model, af512_to_xy_model, test_features, test_xy_coords, 
+        aero_model, af512_to_xy_model, test_features, test_xy_coords,
+        correction_model=correction_model, normalization_data=normalization_data,
         device=device, num_samples=20
     )
     visualize_error_distribution(pipeline_results)

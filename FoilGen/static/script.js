@@ -711,14 +711,43 @@ async function generateAirfoil() {
                                 // Show loading for final processing
                                 document.getElementById('loading').style.display = 'flex';
                                 
-                                // Display final results
-                                if (data.stats && Object.keys(data.stats).length > 0) {
+                                // Display final results - check if uncorrected data is available
+                                const hasUncorrected = data.uncorrected && data.uncorrected.stats;
+                                
+                                if (hasUncorrected) {
+                                    // Show comparison view
+                                    document.getElementById('correction-comparison').style.display = 'block';
+                                    document.getElementById('regular-stats').style.display = 'none';
+                                    
+                                    // Uncorrected stats
+                                    const ucStats = data.uncorrected.stats;
+                                    document.getElementById('stat-clmax-uncorrected').textContent = formatNumber(ucStats.clmax);
+                                    document.getElementById('stat-clmax-alpha-uncorrected').textContent = `at α = ${ucStats.alpha_clmax.toFixed(2)}°`;
+                                    document.getElementById('stat-cdmin-uncorrected').textContent = formatNumber(ucStats.cdmin);
+                                    document.getElementById('stat-cdmin-alpha-uncorrected').textContent = `at α = ${ucStats.alpha_cdmin.toFixed(2)}°`;
+                                    document.getElementById('stat-ldmax-uncorrected').textContent = formatNumber(ucStats.ldmax);
+                                    document.getElementById('stat-ldmax-alpha-uncorrected').textContent = `at α = ${ucStats.alpha_ldmax.toFixed(2)}°`;
+                                    
+                                    // Corrected stats
+                                    document.getElementById('stat-clmax-corrected').textContent = formatNumber(data.stats.clmax);
+                                    document.getElementById('stat-clmax-alpha-corrected').textContent = `at α = ${data.stats.alpha_clmax.toFixed(2)}°`;
+                                    document.getElementById('stat-cdmin-corrected').textContent = formatNumber(data.stats.cdmin);
+                                    document.getElementById('stat-cdmin-alpha-corrected').textContent = `at α = ${data.stats.alpha_cdmin.toFixed(2)}°`;
+                                    document.getElementById('stat-ldmax-corrected').textContent = formatNumber(data.stats.ldmax);
+                                    document.getElementById('stat-ldmax-alpha-corrected').textContent = `at α = ${data.stats.alpha_ldmax.toFixed(2)}°`;
+                                } else {
+                                    // Show regular stats view
+                                    document.getElementById('correction-comparison').style.display = 'none';
+                                    document.getElementById('regular-stats').style.display = 'grid';
+                                    
+                                    if (data.stats && Object.keys(data.stats).length > 0) {
         document.getElementById('stat-clmax').textContent = formatNumber(data.stats.clmax);
         document.getElementById('stat-clmax-alpha').textContent = `at α = ${data.stats.alpha_clmax.toFixed(2)}°`;
         document.getElementById('stat-cdmin').textContent = formatNumber(data.stats.cdmin);
         document.getElementById('stat-cdmin-alpha').textContent = `at α = ${data.stats.alpha_cdmin.toFixed(2)}°`;
         document.getElementById('stat-ldmax').textContent = formatNumber(data.stats.ldmax);
         document.getElementById('stat-ldmax-alpha').textContent = `at α = ${data.stats.alpha_ldmax.toFixed(2)}°`;
+                                    }
                                 }
         
         document.getElementById('airfoil-plot').src = 'data:image/png;base64,' + data.plots.airfoil_shape;
