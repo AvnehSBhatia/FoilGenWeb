@@ -1,5 +1,7 @@
 """
 Flask Web Application for Interactive Airfoil Design
+
+Check out the project files: https://github.com/AvnehSBhatia/FoilML
 """
 from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 import torch
