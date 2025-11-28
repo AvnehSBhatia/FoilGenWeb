@@ -1,7 +1,7 @@
 """
 Flask Web Application for Interactive Airfoil Design
 
-Check out the project files: https://github.com/AvnehSBhatia/FoilML
+Check out the project files: https://github.com/AvnehSBhatia/FoilGenWeb
 """
 from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 import torch
@@ -134,6 +134,19 @@ def compute_summary_statistics(alpha, cl, cd, cl_cd):
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'output'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# Global error handler for unhandled 500 errors
+@app.errorhandler(500)
+def internal_error(error):
+    import traceback
+    error_msg = str(error) if hasattr(error, '__str__') else 'Internal server error'
+    traceback_str = traceback.format_exc()
+    print(f"Unhandled 500 error: {error_msg}")
+    print(traceback_str)
+    # Return JSON error for API routes
+    if request.path.startswith('/api/'):
+        return jsonify({'error': f'Internal server error: {error_msg}'}), 500
+    return f'An error occurred: {error_msg}', 500
 
 # Hall of Fame storage path (use /data mount from Fly.io volume if available, otherwise local)
 # The /data directory is mounted from the "gallery" Fly.io volume as configured in fly.toml
@@ -525,6 +538,70 @@ def scale_dat_coordinates(x_coords, y_coords):
     scaled_y = y_coords * (2 / x_range)
     
     return scaled_x, scaled_y
+
+def dat_to_dxf(dat_filename, dxf_filename, shape_name=None, fitness=None):
+    """
+    Convert a .dat airfoil file to .dxf format with smooth splines.
+    
+    Args:
+        dat_filename: Path to input .dat file
+        dxf_filename: Path to output .dxf file
+        shape_name: Optional shape name (unused but kept for compatibility)
+        fitness: Optional fitness value (unused but kept for compatibility)
+    
+    Returns:
+        True if conversion successful, False otherwise
+    """
+    try:
+        with open(dat_filename, 'r') as f:
+            lines = f.readlines()
+        
+        coord_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('Optimized') and not line.startswith('L/D') and not line.startswith('CL') and not line.startswith('Flight') and not line.startswith('Reynolds') and not line.startswith('Generated') and not line.startswith('Hall of Fame'):
+                try:
+                    parts = line.split()
+                    if len(parts) == 2:
+                        x, y = float(parts[0]), float(parts[1])
+                        coord_lines.append((x, y))
+                except ValueError:
+                    continue
+        
+        if not coord_lines:
+            print(f"   No coordinates found in DAT file")
+            return False
+        
+        coords = np.array(coord_lines)
+        
+        scale = 152.4  # mm (0.5 ft chord)
+        scaled_coords = coords * scale
+        
+        mid_point = len(scaled_coords) // 2
+        
+        upper_surface = scaled_coords[:mid_point+1]
+        lower_surface = np.vstack([scaled_coords[0], scaled_coords[mid_point:], scaled_coords[0]])
+        
+        with open(dxf_filename, "w") as f:
+            f.write("0\nSECTION\n2\nHEADER\n0\nENDSEC\n")
+            f.write("0\nSECTION\n2\nTABLES\n0\nENDSEC\n")
+            f.write("0\nSECTION\n2\nBLOCKS\n0\nENDSEC\n")
+            f.write("0\nSECTION\n2\nENTITIES\n")
+            
+            f.write("0\nLWPOLYLINE\n8\n0\n90\n{}\n70\n0\n".format(len(upper_surface)))
+            for x, y in upper_surface:
+                f.write("10\n{:.6f}\n20\n{:.6f}\n".format(x, y))
+            
+            f.write("0\nLWPOLYLINE\n8\n0\n90\n{}\n70\n0\n".format(len(lower_surface)))
+            for x, y in lower_surface:
+                f.write("10\n{:.6f}\n20\n{:.6f}\n".format(x, y))
+            
+            f.write("0\nENDSEC\n0\nEOF\n")
+        
+        return True
+    except Exception as e:
+        print(f"Error converting DAT to DXF: {e}")
+        return False
 
 @app.route('/')
 def index():
@@ -922,38 +999,97 @@ def generate_and_evaluate_airfoil(Re, Mach, alpha, cl_target, cl_cd_target, min_
 @app.route('/api/optimize_airfoil', methods=['POST'])
 def api_optimize_airfoil():
     """Generate airfoil with specified min and max thickness values."""
-    if xfoil_encoder is None or latent_mapper is None or airfoil_decoder is None:
-        return jsonify({'error': 'Models not loaded'}), 500
+    try:
+        if xfoil_encoder is None or latent_mapper is None or airfoil_decoder is None:
+            return jsonify({'error': 'Models not loaded'}), 500
+        
+        # Validate request has JSON data
+        if not request.is_json:
+            return jsonify({'error': 'Request must be JSON'}), 400
+        
+        # Safely parse JSON data
+        try:
+            data = request.json
+        except Exception as e:
+            return jsonify({'error': f'Invalid JSON: {str(e)}'}), 400
+        
+        if data is None:
+            return jsonify({'error': 'No JSON data provided'}), 400
+        
+        # Validate required fields
+        required_fields = ['re', 'mach', 'alpha', 'cl', 'cl_cd', 'min_thickness', 'max_thickness']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+        
+        # Generate unique request ID for cancellation tracking
+        import uuid
+        request_id = str(uuid.uuid4())
+        optimization_cancelled[request_id] = False
+    except Exception as e:
+        # Catch any exceptions during setup
+        import traceback
+        error_msg = str(e)
+        print(f"Error in api_optimize_airfoil setup: {error_msg}")
+        print(traceback.format_exc())
+        return jsonify({'error': f'Server error during setup: {error_msg}'}), 500
     
-    # Generate unique request ID for cancellation tracking
-    import uuid
-    request_id = str(uuid.uuid4())
-    optimization_cancelled[request_id] = False
+    # Make sure data and request_id are accessible in generator
+    # (they should be via closure, but let's be explicit)
+    generator_data = data
+    generator_request_id = request_id
     
     @stream_with_context
     def generate():
         try:
             # Send request ID as first message
-            yield f"data: {json.dumps({'type': 'init', 'request_id': request_id})}\n\n"
+            try:
+                yield f"data: {json.dumps({'type': 'init', 'request_id': generator_request_id})}\n\n"
+            except Exception as e:
+                # If we can't even send the first message, try to send an error
+                try:
+                    yield f"data: {json.dumps({'type': 'error', 'error': f'Failed to initialize: {str(e)}'})}\n\n"
+                except:
+                    pass
+                return
             
-            data = request.json
+            # Extract inputs with error handling
+            try:
+                Re = float(generator_data['re'])
+                Mach = float(generator_data['mach'])
+                alpha = np.array(generator_data['alpha'])
+                cl_target = np.array(generator_data['cl'])
+                cl_cd_target = np.array(generator_data['cl_cd'])
+                min_thickness = float(generator_data['min_thickness'])
+                max_thickness = float(generator_data['max_thickness'])
+            except (KeyError, ValueError, TypeError) as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': f'Invalid input data: {str(e)}'})}\n\n"
+                return
             
-            # Extract inputs
-            Re = float(data['re'])
-            Mach = float(data['mach'])
-            alpha = np.array(data['alpha'])
-            cl_target = np.array(data['cl'])
-            cl_cd_target = np.array(data['cl_cd'])
-            min_thickness = float(data['min_thickness'])
-            max_thickness = float(data['max_thickness'])
+            # Validate input values
+            if Re <= 0:
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Reynolds number must be positive'})}\n\n"
+                return
+            
+            if len(alpha) == 0 or len(cl_target) == 0 or len(cl_cd_target) == 0:
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Alpha, Cl, and Cl/Cd arrays must not be empty'})}\n\n"
+                return
+            
+            if len(alpha) != len(cl_target) or len(alpha) != len(cl_cd_target):
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Alpha, Cl, and Cl/Cd arrays must have the same length'})}\n\n"
+                return
             
             # Validate thickness values
             if min_thickness >= max_thickness:
                 yield f"data: {json.dumps({'type': 'error', 'error': 'min_thickness must be less than max_thickness'})}\n\n"
                 return
             
+            if min_thickness < 0 or max_thickness < 0:
+                yield f"data: {json.dumps({'type': 'error', 'error': 'Thickness values must be non-negative'})}\n\n"
+                return
+            
             # Check for cancellation
-            if optimization_cancelled.get(request_id, False):
+            if optimization_cancelled.get(generator_request_id, False):
                 yield f"data: {json.dumps({'type': 'cancelled', 'message': 'Optimization cancelled by user'})}\n\n"
                 return
             
@@ -968,58 +1104,64 @@ def api_optimize_airfoil():
                 return
             
             # Generate final plots
+            curves_plot_b64 = ""
             if pred_x is not None:
-                # Aerodynamic curves plot
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-                
-                alpha_arr = np.array(alpha)
-                
-                # Cl vs alpha
-                axes[0].plot(alpha_arr, cl_target, 'b-o', label='Target', linewidth=2, markersize=4)
-                if nf_cl_arr is not None:
-                    valid_mask = ~np.isnan(nf_cl_arr)
-                    if np.sum(valid_mask) > 0:
-                        axes[0].plot(alpha_arr[valid_mask], nf_cl_arr[valid_mask], 'r--s', 
-                                    label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
-                axes[0].set_xlabel('Angle of Attack (deg)')
-                axes[0].set_ylabel('Cl')
-                axes[0].set_title('Lift Coefficient vs AoA')
-                axes[0].legend()
-                axes[0].grid(True, alpha=0.3)
-                
-                # Cd vs alpha
-                cd_target = compute_cd_from_cl_clcd(cl_target, cl_cd_target)
-                axes[1].plot(alpha_arr, cd_target, 'r-o', label='Target', linewidth=2, markersize=4)
-                if nf_cd_arr is not None:
-                    valid_mask = ~np.isnan(nf_cd_arr)
-                    if np.sum(valid_mask) > 0:
-                        axes[1].plot(alpha_arr[valid_mask], nf_cd_arr[valid_mask], 'b--s', 
-                                    label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
-                axes[1].set_xlabel('Angle of Attack (deg)')
-                axes[1].set_ylabel('Cd')
-                axes[1].set_title('Drag Coefficient vs AoA')
-                axes[1].legend()
-                axes[1].grid(True, alpha=0.3)
-                
-                # Cl/Cd vs alpha
-                axes[2].plot(alpha_arr, cl_cd_target, 'g-o', label='Target', linewidth=2, markersize=4)
-                if nf_ld_arr is not None:
-                    valid_mask = ~np.isnan(nf_ld_arr)
-                    if np.sum(valid_mask) > 0:
-                        axes[2].plot(alpha_arr[valid_mask], nf_ld_arr[valid_mask], 'm--s', 
-                                    label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
-                axes[2].set_xlabel('Angle of Attack (deg)')
-                axes[2].set_ylabel('Cl/Cd')
-                axes[2].set_title('Lift-to-Drag Ratio vs AoA')
-                axes[2].legend()
-                axes[2].grid(True, alpha=0.3)
-                
-                plt.tight_layout()
-                img_buf = io.BytesIO()
-                plt.savefig(img_buf, format='png', dpi=150, bbox_inches='tight')
-                img_buf.seek(0)
-                curves_plot_b64 = base64.b64encode(img_buf.read()).decode()
-                plt.close()
+                try:
+                    # Aerodynamic curves plot
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    
+                    alpha_arr = np.array(alpha)
+                    
+                    # Cl vs alpha
+                    axes[0].plot(alpha_arr, cl_target, 'b-o', label='Target', linewidth=2, markersize=4)
+                    if nf_cl_arr is not None:
+                        valid_mask = ~np.isnan(nf_cl_arr)
+                        if np.sum(valid_mask) > 0:
+                            axes[0].plot(alpha_arr[valid_mask], nf_cl_arr[valid_mask], 'r--s', 
+                                        label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
+                    axes[0].set_xlabel('Angle of Attack (deg)')
+                    axes[0].set_ylabel('Cl')
+                    axes[0].set_title('Lift Coefficient vs AoA')
+                    axes[0].legend()
+                    axes[0].grid(True, alpha=0.3)
+                    
+                    # Cd vs alpha
+                    cd_target = compute_cd_from_cl_clcd(cl_target, cl_cd_target)
+                    axes[1].plot(alpha_arr, cd_target, 'r-o', label='Target', linewidth=2, markersize=4)
+                    if nf_cd_arr is not None:
+                        valid_mask = ~np.isnan(nf_cd_arr)
+                        if np.sum(valid_mask) > 0:
+                            axes[1].plot(alpha_arr[valid_mask], nf_cd_arr[valid_mask], 'b--s', 
+                                        label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
+                    axes[1].set_xlabel('Angle of Attack (deg)')
+                    axes[1].set_ylabel('Cd')
+                    axes[1].set_title('Drag Coefficient vs AoA')
+                    axes[1].legend()
+                    axes[1].grid(True, alpha=0.3)
+                    
+                    # Cl/Cd vs alpha
+                    axes[2].plot(alpha_arr, cl_cd_target, 'g-o', label='Target', linewidth=2, markersize=4)
+                    if nf_ld_arr is not None:
+                        valid_mask = ~np.isnan(nf_ld_arr)
+                        if np.sum(valid_mask) > 0:
+                            axes[2].plot(alpha_arr[valid_mask], nf_ld_arr[valid_mask], 'm--s', 
+                                        label='NeuralFoil', linewidth=2, markersize=4, alpha=0.7)
+                    axes[2].set_xlabel('Angle of Attack (deg)')
+                    axes[2].set_ylabel('Cl/Cd')
+                    axes[2].set_title('Lift-to-Drag Ratio vs AoA')
+                    axes[2].legend()
+                    axes[2].grid(True, alpha=0.3)
+                    
+                    plt.tight_layout()
+                    img_buf = io.BytesIO()
+                    plt.savefig(img_buf, format='png', dpi=150, bbox_inches='tight')
+                    img_buf.seek(0)
+                    curves_plot_b64 = base64.b64encode(img_buf.read()).decode()
+                    plt.close()
+                except Exception as e:
+                    print(f"Error generating plots: {e}")
+                    # Use the airfoil plot as fallback, create empty curves plot
+                    curves_plot_b64 = ""
                 
                 # Compute stats from NeuralFoil results
                 nf_stats = None
@@ -1033,13 +1175,17 @@ def api_optimize_airfoil():
                         nf_stats = compute_summary_statistics(nf_alpha_valid, nf_cl_valid, nf_cd_valid, nf_ld_valid)
                 
                 # Save .dat file with scaled coordinates
-                os.makedirs('output', exist_ok=True)
-                dat_path = os.path.join('output', 'generated_airfoil.dat')
-                scaled_x, scaled_y = scale_dat_coordinates(pred_x, pred_y)
-                with open(dat_path, 'w') as f:
-                    f.write("Generated Airfoil\n")
-                    for x, y in zip(scaled_x, scaled_y):
-                        f.write(f"{x:.6f} {y:.6f}\n")
+                try:
+                    os.makedirs('output', exist_ok=True)
+                    dat_path = os.path.join('output', 'generated_airfoil.dat')
+                    scaled_x, scaled_y = scale_dat_coordinates(pred_x, pred_y)
+                    with open(dat_path, 'w') as f:
+                        f.write("Generated Airfoil\n")
+                        for x, y in zip(scaled_x, scaled_y):
+                            f.write(f"{x:.6f} {y:.6f}\n")
+                except Exception as e:
+                    print(f"Error saving .dat file: {e}")
+                    # Continue even if file save fails
                 
                 # Check Hall of Fame eligibility
                 hof_qualifies_ld = False
@@ -1047,19 +1193,51 @@ def api_optimize_airfoil():
                 hof_added_ld = False
                 hof_added_cl = False
                 if nf_stats and NEURALFOIL_AVAILABLE:
-                    re_bin = bin_reynolds_number(Re)
-                    hof_qualifies_ld, hof_qualifies_cl = check_hof_eligibility(re_bin, nf_stats)
-                    
-                    if hof_qualifies_ld or hof_qualifies_cl:
-                        hof_added_ld, hof_added_cl = add_to_hof(
-                            re_bin, nf_stats, pred_x, pred_y,
-                            airfoil_plot, curves_plot_b64,
-                            alpha, nf_cl_arr, nf_cd_arr, nf_ld_arr,
-                            min_thickness, max_thickness
-                        )
+                    try:
+                        re_bin = bin_reynolds_number(Re)
+                        hof_qualifies_ld, hof_qualifies_cl = check_hof_eligibility(re_bin, nf_stats)
+                        
+                        if hof_qualifies_ld or hof_qualifies_cl:
+                            hof_added_ld, hof_added_cl = add_to_hof(
+                                re_bin, nf_stats, pred_x, pred_y,
+                                airfoil_plot, curves_plot_b64,
+                                alpha, nf_cl_arr, nf_cd_arr, nf_ld_arr,
+                                min_thickness, max_thickness
+                            )
+                    except Exception as e:
+                        print(f"Error checking/add to HOF: {e}")
+                        # Continue without HOF operations
                 
                 # Send final result
-                yield f"data: {json.dumps({'type': 'complete', 'success': True, 'x_coords': pred_x.tolist(), 'y_coords': pred_y.tolist(), 'stats': {k: float(v) for k, v in (nf_stats or {}).items()}, 'plots': {'airfoil_shape': airfoil_plot, 'aerodynamic_curves': curves_plot_b64}, 'max_thickness': float(max_thickness), 'min_thickness': float(min_thickness), 'error': float(error), 'hof_added_ld': hof_added_ld, 'hof_added_cl': hof_added_cl})}\n\n"
+                try:
+                    # Safely convert stats to floats
+                    stats_dict = {}
+                    if nf_stats:
+                        for k, v in nf_stats.items():
+                            try:
+                                stats_dict[k] = float(v)
+                            except (ValueError, TypeError):
+                                stats_dict[k] = 0.0
+                    
+                    result_data = {
+                        'type': 'complete',
+                        'success': True,
+                        'x_coords': pred_x.tolist(),
+                        'y_coords': pred_y.tolist(),
+                        'stats': stats_dict,
+                        'plots': {
+                            'airfoil_shape': airfoil_plot,
+                            'aerodynamic_curves': curves_plot_b64
+                        },
+                        'max_thickness': float(max_thickness),
+                        'min_thickness': float(min_thickness),
+                        'error': float(error) if not np.isinf(error) else 999999.0,
+                        'hof_added_ld': hof_added_ld,
+                        'hof_added_cl': hof_added_cl
+                    }
+                    yield f"data: {json.dumps(result_data)}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'error', 'error': f'Error creating final result: {str(e)}'})}\n\n"
             else:
                 yield f"data: {json.dumps({'type': 'complete', 'success': False, 'error': 'No valid airfoil generated'})}\n\n"
         
@@ -1067,10 +1245,18 @@ def api_optimize_airfoil():
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
         finally:
             # Clean up cancellation tracking
-            if request_id in optimization_cancelled:
-                del optimization_cancelled[request_id]
+            if generator_request_id in optimization_cancelled:
+                del optimization_cancelled[generator_request_id]
     
-    return Response(generate(), mimetype='text/event-stream', headers={'X-Request-ID': request_id})
+    try:
+        return Response(generate(), mimetype='text/event-stream', headers={'X-Request-ID': generator_request_id})
+    except Exception as e:
+        # If Response creation fails, return a regular JSON error response
+        import traceback
+        error_msg = str(e)
+        print(f"Error creating Response object: {error_msg}")
+        print(traceback.format_exc())
+        return jsonify({'error': f'Server error creating response: {error_msg}'}), 500
 
 @app.route('/api/cancel_optimization', methods=['POST'])
 def api_cancel_optimization():
@@ -1089,6 +1275,22 @@ def api_download_dat():
         return send_file(dat_path, as_attachment=True, download_name='generated_airfoil.dat')
     else:
         return jsonify({'error': 'No airfoil file generated yet'}), 404
+
+@app.route('/api/download_dxf', methods=['GET'])
+def api_download_dxf():
+    """Download the generated airfoil as a .dxf file."""
+    dat_path = os.path.join('output', 'generated_airfoil.dat')
+    if not os.path.exists(dat_path):
+        return jsonify({'error': 'No airfoil file generated yet'}), 404
+    
+    # Create temporary DXF file
+    dxf_path = os.path.join('output', 'generated_airfoil.dxf')
+    
+    # Convert DAT to DXF
+    if dat_to_dxf(dat_path, dxf_path):
+        return send_file(dxf_path, as_attachment=True, download_name='generated_airfoil.dxf')
+    else:
+        return jsonify({'error': 'Failed to convert airfoil to DXF format'}), 500
 
 @app.route('/api/export_config', methods=['GET', 'POST'])
 def api_export_config():

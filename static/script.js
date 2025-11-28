@@ -1110,6 +1110,11 @@ function downloadDat() {
     window.open(`${API_BASE}/api/download_dat`, '_blank');
 }
 
+// Download .dxf file
+function downloadDxf() {
+    window.open(`${API_BASE}/api/download_dxf`, '_blank');
+}
+
 // Enter key handlers and initialization
 document.addEventListener('DOMContentLoaded', function() {
     // Load colors on page load

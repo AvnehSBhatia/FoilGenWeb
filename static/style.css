@@ -354,6 +354,10 @@ header h1 {
 .download-section {
     text-align: center;
     margin-top: 30px;
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    flex-wrap: wrap;
 }
 
 .progress-container {
