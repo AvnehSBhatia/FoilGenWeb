@@ -1,5 +1,7 @@
-bigfoil
-unpacked_csv
-.venv
-output
-hof_data
+bigfoil/
+data/
+models
+output/
+hof_data/
+__pycache__/
+*.pyc

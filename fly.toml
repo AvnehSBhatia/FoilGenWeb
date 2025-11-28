@@ -1,0 +1,27 @@
+# fly.toml app configuration file generated for foilgen on 2025-11-04T21:12:35-08:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'foilgen'
+primary_region = 'sjc'
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+[mounts]
+  source = "gallery"
+  destination = "/data"
+
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
